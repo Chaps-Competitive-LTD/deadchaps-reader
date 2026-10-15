@@ -1,0 +1,14 @@
+[package]
+name = "deadchaps-memgrant"
+version = "1.0.0"
+description = "Opens Deadlock's memory for the DeadChaps Companion on Linux and hands the open file over"
+license-file = "../LICENSE.md"
+edition = "2024"
+publish = false
+
+[[bin]]
+name = "deadchaps-memgrant"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

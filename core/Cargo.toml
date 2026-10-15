@@ -1,0 +1,31 @@
+[package]
+name = "deadchaps-reader-core"
+version = "1.0.0"
+description = "Reads Deadlock's match state from the running game, read-only, for the DeadChaps Companion"
+license-file = "../LICENSE.md"
+edition = "2024"
+publish = false
+
+[lib]
+name = "deadchaps_reader"
+
+[features]
+# Opening and reading the game's process, and the thread that does it. Only
+# the reader program turns this on; the Companion app builds without it and
+# so holds no code that opens the game.
+process = ["windows-sys/Win32_System_Memory", "windows-sys/Win32_System_Diagnostics_Debug"]
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0"
+memchr = "2.8.0"
+tracing = "0.1.44"
+
+[target.'cfg(windows)'.dependencies]
+# The process list (Toolhelp) and a program's path (a query-only handle).
+# Reading memory (`Win32_System_Memory`, `Win32_System_Diagnostics_Debug`)
+# comes only with the `process` feature, below.
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_Diagnostics_ToolHelp"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
