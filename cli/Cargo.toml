@@ -1,6 +1,6 @@
 [package]
 name = "deadchaps-reader"
-version = "1.0.0"
+version = "1.0.1"
 description = "The DeadChaps Companion's game reader: reads Deadlock's match state, read-only, and reports it as JSON"
 license-file = "../LICENSE.md"
 edition = "2024"

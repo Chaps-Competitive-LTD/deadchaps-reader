@@ -142,6 +142,8 @@ fn replay_until(s: &Seating, new: bool, some: f64, all: f64, until: f64) -> Outc
     let mut last_full = s.last_pass;
     let mut last_sweep: Option<f64> = None;
     let mut last_took: Option<f64> = None;
+    // How long the last full pass took: the new rule rests in proportion.
+    let mut pass_took: Option<f64> = None;
     let mut observed = s.passes.iter();
     let mut players = 0_usize;
     let mut loading = false;
@@ -164,7 +166,7 @@ fn replay_until(s: &Seating, new: bool, some: f64, all: f64, until: f64) -> Outc
             (Some(a), Some(b)) => Some(d(t - a.max(b))),
             (a, b) => a.or(b).map(|e| d(t - e)),
         };
-        if pass_due(last_full.map(|e| d(t - e)), want, false) {
+        if pass_due(last_full.map(|e| d(t - e)), want, false, pass_took.filter(|_| new).map(d)) {
             let p = observed.next().or_else(|| s.passes.last()).expect("a pass");
             let start = t;
             t += p.1;
@@ -176,6 +178,7 @@ fn replay_until(s: &Seating, new: bool, some: f64, all: f64, until: f64) -> Outc
                 return out;
             }
             last_full = Some(t);
+            pass_took = Some(p.1);
             loading = (p.4 as usize) << 20 < STILL_LOADING_BYTES;
             if players > 0 {
                 short_spent += if new { SWEEPS_PER_PASS } else { 1 };
@@ -359,7 +362,7 @@ fn a_late_pop_is_read_within_a_sweep_or_two() {
     // minutes after the one before.
     let old_window = Duration::from_secs(300);
     assert!(!old_seating_pass_wanted(Some(old_window), 0));
-    assert!(!pass_due(Some(Duration::from_secs(300)), false, false));
+    assert!(!pass_due(Some(Duration::from_secs(300)), false, false, None));
     // The new: the queue stopping is the sign, and the replay from it is
     // the same as from the party going.
     let new = replay(s, true, 51.0, 51.0);

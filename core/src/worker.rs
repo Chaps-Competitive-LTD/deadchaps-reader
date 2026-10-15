@@ -63,8 +63,16 @@ const IDLE_PASS_EVERY: Duration = Duration::from_secs(600);
 /// ... and this often in one, where the kept pieces carry everything.
 const MATCH_PASS_EVERY: Duration = Duration::from_secs(1800);
 /// A pass something asked for (a match ended, the pieces lost their records)
-/// still waits this long after the last one.
+/// still waits this long after the last one ...
 const MIN_PASS_GAP: Duration = Duration::from_secs(30);
+/// ... and on a PC where the last pass took longer than `SLOW_PASS`, that
+/// long times `PASS_REST_RATIO`, so the reader reads at most a fifth of the
+/// time. A pass over 14 GB has taken 40 to 52 s on a PC short of memory, and
+/// with only `MIN_PASS_GAP` between them the reader read the game for five
+/// minutes almost without a break, which the player felt as the game
+/// slowing down.
+const SLOW_PASS: Duration = Duration::from_secs(20);
+const PASS_REST_RATIO: u32 = 4;
 /// A game read while it is still starting (about 2 MB in 18 regions at
 /// launch, with nothing in it) is read again soon rather than after the idle
 /// interval. A game that has loaded is many gigabytes.
@@ -246,6 +254,76 @@ fn below_normal_priority() {
     let ok = unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
     if ok == 0 {
         warn!("Game memory: could not lower the reader's priority");
+    }
+}
+
+/// A read of the whole game in Windows' background mode, for as long as the
+/// value lives: the thread's disk and memory priority drop as well as its
+/// CPU priority. Reading a part of the game that Windows has moved out of
+/// memory brings it back from the disk, and in background mode that waits
+/// behind the game's own reads.
+#[cfg(windows)]
+struct Background(bool);
+
+#[cfg(windows)]
+impl Background {
+    fn begin() -> Self {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
+        // SAFETY: the current thread's pseudo handle, and a documented mode
+        // that only the thread itself may set.
+        Self(unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) } != 0)
+    }
+
+    #[cfg(test)]
+    fn on(&self) -> bool {
+        self.0
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Background {
+    fn drop(&mut self) {
+        use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_END};
+        if self.0 {
+            // SAFETY: as in `begin`; ending the mode restores the thread's
+            // priority as it was before.
+            unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_END) };
+        }
+    }
+}
+
+/// On Linux the thread's disk priority drops to the idle class instead, the
+/// part of background mode Linux has, and comes back as it was after.
+#[cfg(target_os = "linux")]
+struct Background(Option<libc::c_long>);
+
+#[cfg(target_os = "linux")]
+const IOPRIO_WHO_PROCESS: libc::c_long = 1;
+
+#[cfg(target_os = "linux")]
+impl Background {
+    fn begin() -> Self {
+        const IDLE: libc::c_long = 3 << 13;
+        // SAFETY: ioprio_get and ioprio_set take plain integers; who 0 is the
+        // calling thread.
+        let before = unsafe { libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0) };
+        let set = unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, IDLE) } == 0;
+        Self((set && before >= 0).then_some(before))
+    }
+
+    #[cfg(test)]
+    fn on(&self) -> bool {
+        self.0.is_some()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for Background {
+    fn drop(&mut self) {
+        if let Some(before) = self.0 {
+            // SAFETY: as in `begin`.
+            unsafe { libc::syscall(libc::SYS_ioprio_set, IOPRIO_WHO_PROCESS, 0, before) };
+        }
     }
 }
 
@@ -967,21 +1045,33 @@ fn read_bans(game: &GameProcess, at: usize) -> Option<Vec<u32>> {
 /// the end can miss it, and the game frees it again before the next
 /// scheduled pass ten minutes on. Without its metadata salt, neither
 /// DeadChaps nor deadlock-api can fetch the match's metadata from Valve
-/// quickly.
-fn reply_pass_wanted(waiting: Option<(u64, Duration)>, replied: &[u64]) -> bool {
-    waiting.is_some_and(|(match_id, gap)| gap < REPLY_FOR && !replied.contains(&match_id))
+/// quickly. Never while the next match is on (`match_on`): a lobby that
+/// empties and fills again within the window (a dodged or watched match)
+/// would otherwise have the reader read the whole game every half minute
+/// through the new match's lane phase.
+fn reply_pass_wanted(waiting: Option<(u64, Duration)>, replied: &[u64], match_on: bool) -> bool {
+    !match_on && waiting.is_some_and(|(match_id, gap)| gap < REPLY_FOR && !replied.contains(&match_id))
 }
 
 /// Whether a full pass runs now: the first for a game, then one every
 /// `IDLE_PASS_EVERY`, or `MATCH_PASS_EVERY` in a fully read match, or sooner
-/// when asked, but never within `MIN_PASS_GAP` of the last.
-fn pass_due(since_last: Option<Duration>, asked: bool, in_match: bool) -> bool {
+/// when asked, but never within `pass_rest` of the last, which took `took`.
+fn pass_due(since_last: Option<Duration>, asked: bool, in_match: bool, took: Option<Duration>) -> bool {
     let every = if in_match {
         MATCH_PASS_EVERY
     } else {
         IDLE_PASS_EVERY
     };
-    since_last.is_none_or(|gap| gap >= every || (asked && gap >= MIN_PASS_GAP))
+    since_last.is_none_or(|gap| gap >= every || (asked && gap >= pass_rest(took)))
+}
+
+/// The least time between a pass and the next one asked for, after a pass
+/// that took `took` (see `SLOW_PASS`).
+fn pass_rest(took: Option<Duration>) -> Duration {
+    match took {
+        Some(took) if took > SLOW_PASS => MIN_PASS_GAP.max(took * PASS_REST_RATIO),
+        _ => MIN_PASS_GAP,
+    }
 }
 
 /// The local player from the last read, to keep the lobby up when our object
@@ -1161,6 +1251,8 @@ fn run(
     // Whether the last pass kept pieces holding history or an end line.
     let mut hot_held_history = false;
     let mut last_pass: Option<Instant> = None;
+    // How long the last full pass took, which spaces the next (`pass_rest`).
+    let mut last_pass_took: Option<Duration> = None;
     let mut last_watch: Option<Instant> = None;
     // Where the last pass found the match's players.
     let mut player_spots: Vec<usize> = Vec::new();
@@ -1379,8 +1471,9 @@ fn run(
         let players_pass_asked =
             want_for_players && !player_pass_waits(seating_from.map(|at| at.elapsed()), sweeping);
         let asked = want_pass || players_pass_asked;
-        if pass_due(last_pass.map(|at| at.elapsed()), asked, full_match) {
+        if pass_due(last_pass.map(|at| at.elapsed()), asked, full_match, last_pass_took) {
             let reason_now = if asked { pass_reason } else { "the schedule" };
+            let quiet = Background::begin();
             let started = Instant::now();
             let cpu_before = thread_cpu();
             let regions = process.private_regions();
@@ -1518,7 +1611,9 @@ fn run(
                     }
                 }
             }
+            drop(quiet);
             last_pass = Some(Instant::now());
+            last_pass_took = Some(started.elapsed());
             pass_ran = true;
             hot_held_history = !found.entries.is_empty() || !found.ends.is_empty();
             if let Some(at) = found.rules.first() {
@@ -1711,6 +1806,7 @@ fn run(
                 last_whole_took,
             )
         {
+            let _quiet = Background::begin();
             let started = Instant::now();
             let cpu_before = thread_cpu();
             let regions = process.private_regions();
@@ -1954,14 +2050,6 @@ fn run(
                 awaiting_reply = Some((match_id, Instant::now()));
             }
         }
-        if reply_pass_wanted(awaiting_reply.map(|(id, at)| (id, at.elapsed())), &replied) {
-            want_pass = true;
-            pass_reason = "waiting on Valve's reply";
-        } else if let Some((match_id, _)) = awaiting_reply.take()
-            && !replied.contains(&match_id)
-        {
-            info!("Game memory: no reply for match {match_id} read in {} s", REPLY_FOR.as_secs());
-        }
         if match_players.iter().any(|p| p.is_us) {
             seen_us = true;
         }
@@ -1984,6 +2072,16 @@ fn run(
         // before that, and `last_started` then still names the last one.
         if seated && let Some(id) = named {
             match_roster = Some((id, match_players.clone()));
+        }
+        let waiting = awaiting_reply.map(|(id, at)| (id, at.elapsed()));
+        if reply_pass_wanted(waiting, &replied, seated || running) {
+            want_pass = true;
+            pass_reason = "waiting on Valve's reply";
+        } else if waiting.is_some_and(|(_, gap)| gap >= REPLY_FOR)
+            && let Some((match_id, _)) = awaiting_reply.take()
+            && !replied.contains(&match_id)
+        {
+            info!("Game memory: no reply for match {match_id} read in {} s", REPLY_FOR.as_secs());
         }
         if rules_pass_wanted(seated, rules_at.is_some(), rules_tries) {
             want_pass = true;
@@ -2399,11 +2497,15 @@ mod tests {
     #[test]
     fn a_full_pass_runs_first_then_on_events_or_seldom() {
         let secs = Duration::from_secs;
-        assert!(pass_due(None, false, false), "a new game's first pass");
-        assert!(reply_pass_wanted(Some((105_808_982, secs(20))), &[]), "the match just ended");
-        assert!(!reply_pass_wanted(Some((105_808_982, secs(20))), &[105_808_982]), "its reply is read");
-        assert!(!reply_pass_wanted(Some((105_808_982, secs(300))), &[]), "gave up after five minutes");
-        assert!(!reply_pass_wanted(None, &[]), "no match ended");
+        assert!(pass_due(None, false, false, None), "a new game's first pass");
+        assert!(reply_pass_wanted(Some((105_808_982, secs(20))), &[], false), "the match just ended");
+        assert!(!reply_pass_wanted(Some((105_808_982, secs(20))), &[105_808_982], false), "its reply is read");
+        assert!(!reply_pass_wanted(Some((105_808_982, secs(300))), &[], false), "gave up after five minutes");
+        assert!(!reply_pass_wanted(None, &[], false), "no match ended");
+        assert!(
+            !reply_pass_wanted(Some((117_534_730, secs(225))), &[], true),
+            "the next match is on: its lane phase is not read through"
+        );
         // Players gone mid match, rules in progress, no end line: held while
         // they are gone (67 s in this case)...
         let s = |n: u64| Duration::from_secs(n);
@@ -2432,23 +2534,31 @@ mod tests {
         assert!(!settling_pass_wanted(secs(600), false), "gave up: the idle passes take over");
         assert!(!settling_pass_wanted(secs(30), true), "our player was read");
         assert!(
-            !pass_due(Some(secs(120)), false, false),
+            !pass_due(Some(secs(120)), false, false, None),
             "two minutes is not a reason"
         );
         assert!(
-            pass_due(Some(secs(600)), false, false),
+            pass_due(Some(secs(600)), false, false, None),
             "ten minutes out of a match"
         );
         assert!(
-            !pass_due(Some(secs(600)), false, true),
+            !pass_due(Some(secs(600)), false, true, None),
             "in a match the hot pieces carry it"
         );
-        assert!(pass_due(Some(secs(1800)), false, true));
-        assert!(!pass_due(Some(secs(29)), true, true), "asked, but too soon");
+        assert!(pass_due(Some(secs(1800)), false, true, None));
+        assert!(!pass_due(Some(secs(29)), true, true, None), "asked, but too soon");
         assert!(
-            pass_due(Some(secs(30)), true, true),
+            pass_due(Some(secs(30)), true, true, None),
             "asked: a queue, a match named, a match ended"
         );
+        // A mid-range PC's pass (15 to 20 s) keeps the 30 s rest ...
+        assert!(pass_due(Some(secs(30)), true, true, Some(secs(18))));
+        // ... and a PC short of memory, where a pass took 41 s, rests 164 s.
+        assert_eq!(pass_rest(Some(secs(41))), secs(164));
+        assert!(!pass_due(Some(secs(31)), true, true, Some(secs(41))), "the next pass of the lane phase storm");
+        assert!(pass_due(Some(secs(164)), true, true, Some(secs(41))));
+        // The schedule is untouched by the rest.
+        assert!(pass_due(Some(secs(1800)), false, true, Some(secs(52))));
     }
 
     #[test]
@@ -2572,6 +2682,42 @@ mod tests {
             ult: None,
             hero_damage: None,
         }
+    }
+
+    #[test]
+    fn background_mode_is_entered_and_left() {
+        let quiet = Background::begin();
+        assert!(quiet.on(), "the mode was refused");
+        drop(quiet);
+        // Windows refuses to enter the mode from inside it, so entering again
+        // shows it was left.
+        let again = Background::begin();
+        assert!(again.on(), "the mode was not left");
+    }
+
+    #[test]
+    fn no_reply_hunt_through_the_next_matchs_lane_phase() {
+        // As read from a player's game: a lobby emptied (its match taken as
+        // ended, the console still naming it), then the next match seated
+        // 13 objects, a spectator on slot 0 and us on team 2 slot 4, the
+        // rules in progress. The reply hunt for the match before ran a full
+        // pass of 13 to 14.5 GB every 30 s from here for five minutes.
+        let mut lobby = vec![seated(320_370_657, 1, 0, false)];
+        for slot in 1..=12_u8 {
+            let team = if slot <= 6 { 2 } else { 3 };
+            lobby.push(seated(1_000 + u32::from(slot), team, slot, slot == 4));
+        }
+        let running = match_running(Some(STATE_IN_PROGRESS), Some(117_534_730), Some(117_534_730));
+        assert!(!running, "its end line was read, so it does not count as running");
+        let seated_now = seated_in_match(&lobby, true, running);
+        assert!(seated_now, "seated all the same");
+        let waiting = Some((117_534_730, Duration::from_secs(225)));
+        assert!(!reply_pass_wanted(waiting, &[], seated_now || running));
+        // Back in the hideout, a hunt still in its window goes on.
+        let party = vec![seated(318_657_394, 2, 1, true)];
+        let seated_after = seated_in_match(&party, false, false);
+        assert!(!seated_after);
+        assert!(reply_pass_wanted(Some((117_534_730, Duration::from_secs(60))), &[], seated_after));
     }
 
     #[test]
