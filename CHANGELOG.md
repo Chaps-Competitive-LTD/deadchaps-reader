@@ -1,5 +1,9 @@
 # DeadChaps reader
 
+## 1.0.3
+
+- The match timers show even when the reader cannot find the game's own line naming the match, which left some players with no timers at all.
+
 ## 1.0.2
 
 - The match timers come back if the reader misses them at the start of a match: it now looks again every five minutes instead of giving up after its first few tries. This happened after watching a replay.

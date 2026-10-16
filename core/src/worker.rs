@@ -868,6 +868,17 @@ fn match_running(rules_state: Option<u32>, named: Option<u64>, last_end: Option<
     rules_state == Some(STATE_IN_PROGRESS) && named.is_some_and(|m| last_end.is_none_or(|e| e < m))
 }
 
+/// Whether the match timers show: our player seated, the rules object
+/// reading "in progress", and, when the console has named the match, that
+/// match not closed by an end line. The console's name is not required: a
+/// player's log had a whole match read with its rules and
+/// players but the console line never found, and the timers never showed.
+/// A replay seats nobody, and a finished match's rules object no longer
+/// reads in progress, so neither needs the name to be told apart.
+fn timers_on(seated: bool, rules_state: Option<u32>, named: Option<u64>, running: bool) -> bool {
+    seated && rules_state == Some(STATE_IN_PROGRESS) && (running || named.is_none())
+}
+
 /// Whether the local player is seated in a match, which drives the passes
 /// for missing players and for the rules object, and the timers. Our object
 /// off slot 0 is not enough: since the City Never Sleeps update the hideout
@@ -2192,7 +2203,7 @@ fn run(
         // The timers only while the game says the match is being played: a
         // finished match's rules object stands still at its last clock, and
         // the timers would stay frozen after the match.
-        let objectives = match (seated && running, rules_now, our_time) {
+        let objectives = match (timers_on(seated, rules_now.map(|r| r.state), named, running), rules_now, our_time) {
             (true, Some(r), Some(now)) => Some(Objectives {
                 clock: super::rules::match_clock(now, r.game_start, clock_now).0,
                 paused: super::rules::match_clock(now, r.game_start, clock_now).1,
@@ -2729,6 +2740,21 @@ mod tests {
         // shows it was left.
         let again = Background::begin();
         assert!(again.on(), "the mode was not left");
+    }
+
+    #[test]
+    fn the_timers_show_without_the_consoles_match_name() {
+        // A match read with its rules in progress but no console line found.
+        assert!(timers_on(true, Some(STATE_IN_PROGRESS), None, false));
+        // Named and running.
+        assert!(timers_on(true, Some(STATE_IN_PROGRESS), Some(117_929_803), true));
+        // Named, but that match's end line is read: over.
+        assert!(!timers_on(true, Some(STATE_IN_PROGRESS), Some(117_929_803), false));
+        // A finished match's object, the hideout or a replay.
+        assert!(!timers_on(true, Some(8), None, false));
+        assert!(!timers_on(true, Some(11), None, false));
+        assert!(!timers_on(false, Some(STATE_IN_PROGRESS), None, false));
+        assert!(!timers_on(true, None, None, false));
     }
 
     #[test]
