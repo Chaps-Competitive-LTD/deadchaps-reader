@@ -25,8 +25,9 @@ pub enum Speed {
     #[default]
     Balanced,
     /// Low-end PCs: rests after any pass over 10 s, and pauses longer while
-    /// reading.
-    Light,
+    /// reading. Sent as "light" by app 1.0.75, so that is still read.
+    #[serde(alias = "light")]
+    Slow,
 }
 
 /// From the app to the reader.
@@ -75,7 +76,9 @@ mod tests {
         assert_eq!(serde_json::to_string(&ToReader::SetEnabled(true)).unwrap(), r#"{"set_enabled":true}"#);
         assert_eq!(serde_json::to_string(&ToReader::Stop).unwrap(), r#""stop""#);
         assert_eq!(serde_json::to_string(&ToReader::SetSpeed(Speed::Fast)).unwrap(), r#"{"set_speed":"fast"}"#);
-        assert_eq!(serde_json::from_str::<ToReader>(r#"{"set_speed":"light"}"#).unwrap(), ToReader::SetSpeed(Speed::Light));
+        assert_eq!(serde_json::from_str::<ToReader>(r#"{"set_speed":"slow"}"#).unwrap(), ToReader::SetSpeed(Speed::Slow));
+        assert_eq!(serde_json::from_str::<ToReader>(r#"{"set_speed":"light"}"#).unwrap(), ToReader::SetSpeed(Speed::Slow));
+        assert_eq!(serde_json::to_string(&Speed::Slow).unwrap(), r#""slow""#);
         assert_eq!(
             serde_json::to_string(&ToReader::Valve { id: 3, has: false }).unwrap(),
             r#"{"valve":{"id":3,"has":false}}"#

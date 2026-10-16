@@ -1,5 +1,9 @@
 # DeadChaps reader
 
+## 1.0.8
+
+- The Light reading speed is now called Slow.
+
 ## 1.0.7
 
 - Matches reach DeadChaps sooner: the reader looks for a match's replay details as soon as the game ends it, instead of up to two minutes later.

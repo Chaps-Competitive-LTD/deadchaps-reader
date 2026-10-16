@@ -285,7 +285,7 @@ fn set_speed(speed: crate::protocol::Speed) {
     let n = match speed {
         Speed::Fast => 0,
         Speed::Balanced => 1,
-        Speed::Light => 2,
+        Speed::Slow => 2,
     };
     SPEED.store(n, AtomicOrdering::Relaxed);
 }
@@ -294,7 +294,7 @@ fn speed() -> crate::protocol::Speed {
     use crate::protocol::Speed;
     match SPEED.load(AtomicOrdering::Relaxed) {
         0 => Speed::Fast,
-        2 => Speed::Light,
+        2 => Speed::Slow,
         _ => Speed::Balanced,
     }
 }
@@ -571,7 +571,7 @@ fn read_pieces(
                 match speed() {
                     crate::protocol::Speed::Fast => {}
                     crate::protocol::Speed::Balanced => thread::sleep(THROTTLE_PAUSE),
-                    crate::protocol::Speed::Light => thread::sleep(THROTTLE_PAUSE * 2),
+                    crate::protocol::Speed::Slow => thread::sleep(THROTTLE_PAUSE * 2),
                 }
             }
             if want <= OVERLAP || off + want >= region.size {
@@ -1199,7 +1199,7 @@ fn pass_rest(took: Option<Duration>) -> Duration {
 
 /// `pass_rest` at a reading speed: Fast never rests longer than
 /// `MIN_PASS_GAP`, Balanced only after a pass over `SLOW_PASS_BALANCED`,
-/// Light after one over `SLOW_PASS`. A 23 s pass on a high-end PC counted as
+/// Slow after one over `SLOW_PASS`. A 23 s pass on a high-end PC counted as
 /// slow under the one threshold every PC had, and the passes after a match
 /// came 90 s apart instead of 30, so its salts went out later.
 fn pass_rest_at(took: Option<Duration>, speed: crate::protocol::Speed) -> Duration {
@@ -1207,7 +1207,7 @@ fn pass_rest_at(took: Option<Duration>, speed: crate::protocol::Speed) -> Durati
     let slow = match speed {
         Speed::Fast => return MIN_PASS_GAP,
         Speed::Balanced => SLOW_PASS_BALANCED,
-        Speed::Light => SLOW_PASS,
+        Speed::Slow => SLOW_PASS,
     };
     match took {
         Some(took) if took > slow => MIN_PASS_GAP.max(took * PASS_REST_RATIO),
@@ -2757,14 +2757,14 @@ mod tests {
         // A mid-range PC's pass (15 to 20 s) keeps the 30 s rest ...
         assert!(pass_due(Some(secs(30)), true, true, Some(secs(18))));
         // ... and a PC short of memory, where a pass took 41 s, rests 164 s.
-        assert_eq!(pass_rest_at(Some(secs(41)), crate::protocol::Speed::Light), secs(164));
+        assert_eq!(pass_rest_at(Some(secs(41)), crate::protocol::Speed::Slow), secs(164));
         // Balanced, the default: a high-end PC's 23 s pass keeps the 30 s
         // rest; a 52 s pass rests four times as long.
         assert_eq!(pass_rest_at(Some(secs(23)), crate::protocol::Speed::Balanced), secs(30));
         assert_eq!(pass_rest_at(Some(secs(41)), crate::protocol::Speed::Balanced), secs(164), "the lane-phase PC still rests");
-        // Fast never rests longer; Light from 10 s.
+        // Fast never rests longer; Slow from 10 s.
         assert_eq!(pass_rest_at(Some(secs(300)), crate::protocol::Speed::Fast), secs(30));
-        assert_eq!(pass_rest_at(Some(secs(15)), crate::protocol::Speed::Light), secs(60));
+        assert_eq!(pass_rest_at(Some(secs(15)), crate::protocol::Speed::Slow), secs(60));
         assert!(!pass_due(Some(secs(31)), true, true, Some(secs(41))), "the next pass of the lane phase storm");
         assert!(pass_due(Some(secs(164)), true, true, Some(secs(41))));
         // The schedule is untouched by the rest.
