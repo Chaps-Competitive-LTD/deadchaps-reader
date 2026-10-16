@@ -1,5 +1,13 @@
 # DeadChaps reader
 
+## 1.0.6
+
+- No match timers in Street Brawl, which has no bridge buffs and no mid boss.
+
+## 1.0.5
+
+- A match read before the game's own match line turns up is no longer taken for the hideout. In Street Brawl this left the reads slow and Discord saying you were in the hideout.
+
 ## 1.0.4
 
 - Much faster on PCs short of memory: while a match is on, the reader reads only the part of the game that is in RAM, so the Lobby fills and the timers show far sooner and the game is not slowed by the reader pulling memory back from the disk.

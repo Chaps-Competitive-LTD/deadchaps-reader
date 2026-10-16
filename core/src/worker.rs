@@ -6,7 +6,8 @@
 
 use super::friends_presence;
 use super::view::{
-    EndedMatch, GameEnd, KEEP_ENDED, MemoryView, Objectives, load_ended, match_leftover, party_shaped,
+    EndedMatch, GameEnd, KEEP_ENDED, MemoryView, Objectives, PARTY_MAX, load_ended, match_leftover, party_shaped,
+    reads_as,
 };
 use crate::game_process::game_pid;
 use super::players::{self, MatchPlayer, Offsets};
@@ -622,8 +623,7 @@ fn missing_seats(players: &[MatchPlayer]) -> usize {
     }
     seats.sort_unstable();
     seats.dedup();
-    let brawl = seats.iter().any(|&(team, slot)| team == 3 && slot <= 6);
-    let full: usize = if brawl { 8 } else { 12 };
+    let full: usize = if brawl_seated(&seats) { 8 } else { 12 };
     full.saturating_sub(seats.len())
 }
 
@@ -896,6 +896,20 @@ fn regions_to_read(process: &GameProcess, in_ram: bool, logged: &mut Option<usiz
     (resident, true)
 }
 
+/// Whether our player is playing a match the console has not named yet:
+/// seated on team 3 past any seat a party uses (6v6 seats team 3 in 7 to
+/// 12, Street Brawl in 5 to 8), and moving since the last read (`last`). A
+/// finished match leaves our object frozen in its seat for minutes, which
+/// is not this. Without it a Street Brawl read with five of its players,
+/// before the console's line or the rules object turned up, counted as a
+/// party in the hideout: the timers were not looked for, the reads were not
+/// a match's, and Discord said the hideout.
+fn playing_unnamed(us: Option<&MatchPlayer>, last: Option<&MatchPlayer>) -> bool {
+    us.zip(last).is_some_and(|(us, last)| {
+        us.team == 3 && usize::from(us.slot) > PARTY_MAX && us.account_id == last.account_id && !reads_as(us, last)
+    })
+}
+
 /// Whether the match timers show: our player seated, the rules object
 /// reading "in progress", and, when the console has named the match, that
 /// match not closed by an end line. The console's name is not required: a
@@ -903,8 +917,26 @@ fn regions_to_read(process: &GameProcess, in_ram: bool, logged: &mut Option<usiz
 /// players but the console line never found, and the timers never showed.
 /// A replay seats nobody, and a finished match's rules object no longer
 /// reads in progress, so neither needs the name to be told apart.
-fn timers_on(seated: bool, rules_state: Option<u32>, named: Option<u64>, running: bool) -> bool {
-    seated && rules_state == Some(STATE_IN_PROGRESS) && (running || named.is_none())
+///
+/// Never in Street Brawl (`brawl`): it has no bridge buffs and no mid boss.
+fn timers_on(seated: bool, rules_state: Option<u32>, named: Option<u64>, running: bool, brawl: bool) -> bool {
+    !brawl && seated && rules_state == Some(STATE_IN_PROGRESS) && (running || named.is_none())
+}
+
+/// The game mode the lobby object gives Street Brawl (ECitadelGameMode).
+const GAME_MODE_STREET_BRAWL: u32 = 4;
+
+/// Whether the seats read are Street Brawl's: it seats team 3 from slot 5,
+/// a 6v6 from slot 7 (as read from the live game).
+fn brawl_seated(seats: &[(u8, u8)]) -> bool {
+    seats.iter().any(|&(team, slot)| team == 3 && (1..=6).contains(&slot))
+}
+
+/// Whether the match is Street Brawl: the lobby's game mode when known,
+/// else its seats.
+fn street_brawl(modes: Option<(u32, u32)>, players: &[MatchPlayer]) -> bool {
+    modes.is_some_and(|(_, game)| game == GAME_MODE_STREET_BRAWL)
+        || brawl_seated(&players.iter().map(|p| (p.team, p.slot)).collect::<Vec<_>>())
 }
 
 /// Whether the local player is seated in a match, which drives the passes
@@ -1315,6 +1347,9 @@ fn run(
     // The local player as last read, kept after the lobby goes, so the match
     // that just ended can carry their numbers.
     let mut last_us: Option<MatchPlayer> = None;
+    // Our player seen playing a match the console has not named
+    // (`playing_unnamed`), until the lobby empties or the game ends it.
+    let mut playing_seen = false;
     // The other accounts seen in the lobby lately, and when.
     let mut watched: HashMap<u32, Instant> = HashMap::new();
     // Whether our player is being held from the last read (see `hold_us`).
@@ -2147,8 +2182,19 @@ fn run(
                 ),
             )
         };
+        let us_now = match_players.iter().find(|p| p.is_us);
+        let us_elsewhere = us_now.is_some_and(|us| us.team != 3 || usize::from(us.slot) <= PARTY_MAX);
+        if match_players.is_empty() || us_elsewhere || rules_now.is_some_and(|r| r.state > STATE_IN_PROGRESS) {
+            playing_seen = false;
+        } else if !playing_seen && playing_unnamed(us_now, last_us.as_ref()) {
+            playing_seen = true;
+            info!("Game memory: our player is playing in a match seat the console has not named yet: read as a match");
+        }
+        // Read as running for the hideout test and the seating, not for the
+        // timers (which need the rules in progress, see `timers_on`).
+        let running_or_playing = running || playing_seen;
         let match_named = named.is_some();
-        let seated = seated_in_match(&match_players, match_named, running);
+        let seated = seated_in_match(&match_players, match_named, running_or_playing);
         // Only once the console names the match: a loading match is seated
         // before that, and `last_started` then still names the last one.
         if seated && let Some(id) = named {
@@ -2242,7 +2288,8 @@ fn run(
         // The timers only while the game says the match is being played: a
         // finished match's rules object stands still at its last clock, and
         // the timers would stay frozen after the match.
-        let objectives = match (timers_on(seated, rules_now.map(|r| r.state), named, running), rules_now, our_time) {
+        let brawl = street_brawl(lock(&shared.view).match_modes, &match_players);
+        let objectives = match (timers_on(seated, rules_now.map(|r| r.state), named, running, brawl), rules_now, our_time) {
             (true, Some(r), Some(now)) => Some(Objectives {
                 clock: super::rules::match_clock(now, r.game_start, clock_now).0,
                 paused: super::rules::match_clock(now, r.game_start, clock_now).1,
@@ -2337,7 +2384,7 @@ fn run(
         let steam_id = steam_account();
         publish(&|v| {
             v.objectives = objectives;
-            v.match_running = running;
+            v.match_running = running_or_playing;
             if !entries.is_empty() {
                 // Keep what was already known about older matches when a
                 // smaller list is read.
@@ -2782,18 +2829,59 @@ mod tests {
     }
 
     #[test]
+    fn our_player_moving_in_a_team_3_seat_is_a_match_not_a_party() {
+        // As logged: five of a Street Brawl's eight, us on team 3 slot 7,
+        // levelling between reads, no console line and no rules object yet.
+        let mut before = seated(1_538_671_312, 3, 7, true);
+        before.level = 20;
+        let mut now = before.clone();
+        now.level = 26;
+        assert!(playing_unnamed(Some(&now), Some(&before)));
+        let read = vec![
+            seated(257_194_608, 2, 2, false),
+            seated(8_979_650, 2, 4, false),
+            seated(1_696_858_106, 3, 6, false),
+            now.clone(),
+            seated(57_489_880, 3, 8, false),
+        ];
+        assert!(!seated_in_match(&read, false, false), "without it: a party of five");
+        assert!(seated_in_match(&read, false, true), "with it: seated, so the timers' passes run");
+        // A finished match's object, frozen: not moving, not this.
+        assert!(!playing_unnamed(Some(&before), Some(&before)));
+        // Team 2, or a party seat: never this.
+        let mut team2 = now.clone();
+        team2.team = 2;
+        assert!(!playing_unnamed(Some(&team2), Some(&before)));
+        let mut low = now.clone();
+        low.slot = 5;
+        assert!(!playing_unnamed(Some(&low), Some(&before)));
+        // Nothing to compare with yet.
+        assert!(!playing_unnamed(Some(&now), None));
+    }
+
+    #[test]
     fn the_timers_show_without_the_consoles_match_name() {
         // A match read with its rules in progress but no console line found.
-        assert!(timers_on(true, Some(STATE_IN_PROGRESS), None, false));
+        assert!(timers_on(true, Some(STATE_IN_PROGRESS), None, false, false));
         // Named and running.
-        assert!(timers_on(true, Some(STATE_IN_PROGRESS), Some(117_929_803), true));
+        assert!(timers_on(true, Some(STATE_IN_PROGRESS), Some(117_929_803), true, false));
         // Named, but that match's end line is read: over.
-        assert!(!timers_on(true, Some(STATE_IN_PROGRESS), Some(117_929_803), false));
+        assert!(!timers_on(true, Some(STATE_IN_PROGRESS), Some(117_929_803), false, false));
         // A finished match's object, the hideout or a replay.
-        assert!(!timers_on(true, Some(8), None, false));
-        assert!(!timers_on(true, Some(11), None, false));
-        assert!(!timers_on(false, Some(STATE_IN_PROGRESS), None, false));
-        assert!(!timers_on(true, None, None, false));
+        assert!(!timers_on(true, Some(8), None, false, false));
+        assert!(!timers_on(true, Some(11), None, false, false));
+        assert!(!timers_on(false, Some(STATE_IN_PROGRESS), None, false, false));
+        assert!(!timers_on(true, None, None, false, false));
+        // Street Brawl: no bridge buffs, no mid boss.
+        assert!(!timers_on(true, Some(STATE_IN_PROGRESS), None, true, true));
+        let brawl = vec![seated(1, 2, 1, true), seated(2, 3, 5, false), seated(3, 3, 8, false)];
+        assert!(street_brawl(None, &brawl), "team 3 from slot 5");
+        let six = vec![seated(1, 2, 1, true), seated(2, 3, 7, false), seated(3, 3, 12, false)];
+        assert!(!street_brawl(None, &six), "team 3 from slot 7");
+        assert!(street_brawl(Some((1, GAME_MODE_STREET_BRAWL)), &six), "the lobby's mode says so");
+        assert!(!street_brawl(Some((1, 1)), &six));
+        let squared = vec![seated(1, 2, 1, true), seated(2, 3, 0, false)];
+        assert!(!street_brawl(None, &squared), "slot 0 is nobody's seat");
     }
 
     #[test]
