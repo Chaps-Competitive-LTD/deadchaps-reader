@@ -69,6 +69,11 @@ impl GameProcess {
             .unwrap_or_default()
     }
 
+    /// Not asked on Linux yet: every region is read.
+    pub fn resident(&self, _regions: &[Region]) -> Option<Vec<Region>> {
+        None
+    }
+
     /// The private regions too big to read (over `MAX_REGION`), for the log
     /// when something is not found.
     pub fn too_big(&self) -> Vec<Region> {

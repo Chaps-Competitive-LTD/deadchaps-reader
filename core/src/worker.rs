@@ -868,6 +868,34 @@ fn match_running(rules_state: Option<u32>, named: Option<u64>, last_end: Option<
     rules_state == Some(STATE_IN_PROGRESS) && named.is_some_and(|m| last_end.is_none_or(|e| e < m))
 }
 
+/// The regions a read of the whole game takes: only the parts in RAM when
+/// `in_ram` (sweeps, and passes while a match is on), or all of them when
+/// Windows will not say or out of a match, where the history and Valve's
+/// replies can sit in memory the game has not touched for a while. Logs the
+/// split the first time and whenever it moves by a gigabyte.
+fn regions_to_read(process: &GameProcess, in_ram: bool, logged: &mut Option<usize>) -> (Vec<Region>, bool) {
+    let all = process.private_regions();
+    if !in_ram {
+        return (all, false);
+    }
+    let asking = Instant::now();
+    let Some(resident) = process.resident(&all) else {
+        return (all, false);
+    };
+    let total: usize = all.iter().map(|r| r.size).sum();
+    let kept: usize = resident.iter().map(|r| r.size).sum();
+    if logged.is_none_or(|before| before.abs_diff(kept) >= 1 << 30) {
+        *logged = Some(kept);
+        info!(
+            "Game memory: reading only what is in RAM, {} of {} MB ({} ms to ask)",
+            kept >> 20,
+            total >> 20,
+            asking.elapsed().as_millis()
+        );
+    }
+    (resident, true)
+}
+
 /// Whether the match timers show: our player seated, the rules object
 /// reading "in progress", and, when the console has named the match, that
 /// match not closed by an end line. The console's name is not required: a
@@ -1274,6 +1302,11 @@ fn run(
     // Whether the last pass kept pieces holding history or an end line.
     let mut hot_held_history = false;
     let mut last_pass: Option<Instant> = None;
+    // The in-RAM share last logged (`regions_to_read`), and whether a pass
+    // that read only RAM this match missed the rules object, so the next
+    // reads everything.
+    let mut ram_logged: Option<usize> = None;
+    let mut ram_missed = false;
     // How long the last full pass took, which spaces the next (`pass_rest`).
     let mut last_pass_took: Option<Duration> = None;
     let mut last_watch: Option<Instant> = None;
@@ -1499,7 +1532,8 @@ fn run(
             let quiet = Background::begin();
             let started = Instant::now();
             let cpu_before = thread_cpu();
-            let regions = process.private_regions();
+            let in_match_now = !lock(&shared.view).match_players.is_empty() && !lock(&shared.view).in_hideout();
+            let (regions, ram_only) = regions_to_read(process, in_match_now && !ram_missed, &mut ram_logged);
             // Accounts seen in the lobby lately, ours among them: an object
             // of theirs turned away by the limits is logged with why.
             let mut watch: Vec<u32> = watched.keys().copied().collect();
@@ -1645,6 +1679,10 @@ fn run(
                 }
                 rules_at = Some(*at);
             } else if in_match {
+                if ram_only && !ram_missed {
+                    ram_missed = true;
+                    info!("Game memory: a pass of only what is in RAM missed the rules object; this match's next passes read everything");
+                }
                 rules_tries += 1;
                 let big: Vec<_> = process.too_big().into_iter().map(|r| r.size >> 20).collect();
                 info!(
@@ -1851,7 +1889,7 @@ fn run(
             let _quiet = Background::begin();
             let started = Instant::now();
             let cpu_before = thread_cpu();
-            let regions = process.private_regions();
+            let (regions, _) = regions_to_read(process, true, &mut ram_logged);
             let mut swept = Vec::new();
             let bytes = sweep_players(
                 |a, b| process.read(a, b),
@@ -2005,6 +2043,7 @@ fn run(
             had_match = true;
         } else if match_players.is_empty() {
             had_match = false;
+            ram_missed = false;
             rules_tries = 0;
             short_spent = 0;
         }
