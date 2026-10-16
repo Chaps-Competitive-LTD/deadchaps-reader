@@ -147,6 +147,7 @@ fn run(args: Args) {
         match serde_json::from_str::<ToReader>(&line) {
             Ok(ToReader::SetEnabled(on)) => memory.set_enabled(on),
             Ok(ToReader::SetAllowed(on)) => memory.set_allowed(on),
+            Ok(ToReader::SetSpeed(speed)) => memory.set_speed(speed),
             Ok(ToReader::Account(id)) => *account.lock().unwrap_or_else(PoisonError::into_inner) = id,
             Ok(ToReader::AddEnded(ended)) => {
                 if memory.add_ended(ended) {

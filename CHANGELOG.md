@@ -1,5 +1,10 @@
 # DeadChaps reader
 
+## 1.0.7
+
+- Matches reach DeadChaps sooner: the reader looks for a match's replay details as soon as the game ends it, instead of up to two minutes later.
+- A reading speed you can choose in the Companion's Settings: Fast for high-end PCs, Balanced, or Light for low-end PCs.
+
 ## 1.0.6
 
 - No match timers in Street Brawl, which has no bridge buffs and no mid boss.

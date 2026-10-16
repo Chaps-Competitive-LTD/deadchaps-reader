@@ -17,6 +17,7 @@ use super::{
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -72,7 +73,9 @@ const MIN_PASS_GAP: Duration = Duration::from_secs(30);
 /// with only `MIN_PASS_GAP` between them the reader read the game for five
 /// minutes almost without a break, which the player felt as the game
 /// slowing down.
-const SLOW_PASS: Duration = Duration::from_secs(20);
+const SLOW_PASS: Duration = Duration::from_secs(10);
+/// The slow pass at the Balanced speed, the default.
+const SLOW_PASS_BALANCED: Duration = Duration::from_secs(30);
 const PASS_REST_RATIO: u32 = 4;
 /// A game read while it is still starting (about 2 MB in 18 regions at
 /// launch, with nothing in it) is read again soon rather than after the idle
@@ -193,6 +196,13 @@ impl GameMemory {
         self.shared.change(|c| c.allowed = allowed);
     }
 
+    /// The player's reading speed (`Speed`); takes effect at the next read.
+    pub fn set_speed(&self, speed: crate::protocol::Speed) {
+        info!("Game memory: reading speed {speed:?}");
+        set_speed(speed);
+        self.shared.change(|_| {});
+    }
+
     pub fn stop(&self) {
         self.shared.change(|c| c.stop = true);
     }
@@ -266,10 +276,36 @@ fn below_normal_priority() {
 #[cfg(windows)]
 struct Background(bool);
 
+/// The reading speed, set by the app (`GameMemory::set_speed`) and read by
+/// every pass and sweep.
+static SPEED: AtomicU8 = AtomicU8::new(1);
+
+fn set_speed(speed: crate::protocol::Speed) {
+    use crate::protocol::Speed;
+    let n = match speed {
+        Speed::Fast => 0,
+        Speed::Balanced => 1,
+        Speed::Light => 2,
+    };
+    SPEED.store(n, AtomicOrdering::Relaxed);
+}
+
+fn speed() -> crate::protocol::Speed {
+    use crate::protocol::Speed;
+    match SPEED.load(AtomicOrdering::Relaxed) {
+        0 => Speed::Fast,
+        2 => Speed::Light,
+        _ => Speed::Balanced,
+    }
+}
+
 #[cfg(windows)]
 impl Background {
     fn begin() -> Self {
         use windows_sys::Win32::System::Threading::{GetCurrentThread, SetThreadPriority, THREAD_MODE_BACKGROUND_BEGIN};
+        if speed() == crate::protocol::Speed::Fast {
+            return Self(false);
+        }
         // SAFETY: the current thread's pseudo handle, and a documented mode
         // that only the thread itself may set.
         Self(unsafe { SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN) } != 0)
@@ -305,6 +341,9 @@ const IOPRIO_WHO_PROCESS: libc::c_long = 1;
 impl Background {
     fn begin() -> Self {
         const IDLE: libc::c_long = 3 << 13;
+        if speed() == crate::protocol::Speed::Fast {
+            return Self(None);
+        }
         // SAFETY: ioprio_get and ioprio_set take plain integers; who 0 is the
         // calling thread.
         let before = unsafe { libc::syscall(libc::SYS_ioprio_get, IOPRIO_WHO_PROCESS, 0) };
@@ -529,7 +568,11 @@ fn read_pieces(
             since_pause += got;
             if throttle && since_pause >= THROTTLE_EVERY {
                 since_pause = 0;
-                thread::sleep(THROTTLE_PAUSE);
+                match speed() {
+                    crate::protocol::Speed::Fast => {}
+                    crate::protocol::Speed::Balanced => thread::sleep(THROTTLE_PAUSE),
+                    crate::protocol::Speed::Light => thread::sleep(THROTTLE_PAUSE * 2),
+                }
             }
             if want <= OVERLAP || off + want >= region.size {
                 break;
@@ -1151,8 +1194,23 @@ fn pass_due(since_last: Option<Duration>, asked: bool, in_match: bool, took: Opt
 /// The least time between a pass and the next one asked for, after a pass
 /// that took `took` (see `SLOW_PASS`).
 fn pass_rest(took: Option<Duration>) -> Duration {
+    pass_rest_at(took, speed())
+}
+
+/// `pass_rest` at a reading speed: Fast never rests longer than
+/// `MIN_PASS_GAP`, Balanced only after a pass over `SLOW_PASS_BALANCED`,
+/// Light after one over `SLOW_PASS`. A 23 s pass on a high-end PC counted as
+/// slow under the one threshold every PC had, and the passes after a match
+/// came 90 s apart instead of 30, so its salts went out later.
+fn pass_rest_at(took: Option<Duration>, speed: crate::protocol::Speed) -> Duration {
+    use crate::protocol::Speed;
+    let slow = match speed {
+        Speed::Fast => return MIN_PASS_GAP,
+        Speed::Balanced => SLOW_PASS_BALANCED,
+        Speed::Light => SLOW_PASS,
+    };
     match took {
-        Some(took) if took > SLOW_PASS => MIN_PASS_GAP.max(took * PASS_REST_RATIO),
+        Some(took) if took > slow => MIN_PASS_GAP.max(took * PASS_REST_RATIO),
         _ => MIN_PASS_GAP,
     }
 }
@@ -2201,7 +2259,11 @@ fn run(
             match_roster = Some((id, match_players.clone()));
         }
         let waiting = awaiting_reply.map(|(id, at)| (id, at.elapsed()));
-        if reply_pass_wanted(waiting, &replied, seated || running) {
+        // The next match is on while the rules read in progress, or while we
+        // are seated and no rules object says otherwise; the end screen
+        // (rules past in progress) is not a match on, and the reply comes then.
+        let match_on = rules_now.map_or(seated, |r| r.state == STATE_IN_PROGRESS);
+        if reply_pass_wanted(waiting, &replied, match_on) {
             want_pass = true;
             pass_reason = "waiting on Valve's reply";
         } else if waiting.is_some_and(|(_, gap)| gap >= REPLY_FOR)
@@ -2259,6 +2321,14 @@ fn run(
                 if let Some(end) = game_end_of(game_state_seen.map(|s| s.0), r.state, r.winner, match_id) {
                     info!("Game memory: the game ended match {} (winner team {})", end.match_id, end.winner);
                     publish(&|v| v.game_end = Some(end));
+                    // Valve's reply for the match comes in the next minute
+                    // or so: look for it now, not when the lobby empties or
+                    // the schedule comes round (that took 2 minutes).
+                    if !replied.contains(&end.match_id) && awaiting_reply.is_none_or(|(id, _)| id != end.match_id) {
+                        awaiting_reply = Some((end.match_id, Instant::now()));
+                    }
+                    want_pass = true;
+                    pass_reason = "the game ended the match";
                 }
                 game_state_seen = Some(now);
             }
@@ -2687,7 +2757,14 @@ mod tests {
         // A mid-range PC's pass (15 to 20 s) keeps the 30 s rest ...
         assert!(pass_due(Some(secs(30)), true, true, Some(secs(18))));
         // ... and a PC short of memory, where a pass took 41 s, rests 164 s.
-        assert_eq!(pass_rest(Some(secs(41))), secs(164));
+        assert_eq!(pass_rest_at(Some(secs(41)), crate::protocol::Speed::Light), secs(164));
+        // Balanced, the default: a high-end PC's 23 s pass keeps the 30 s
+        // rest; a 52 s pass rests four times as long.
+        assert_eq!(pass_rest_at(Some(secs(23)), crate::protocol::Speed::Balanced), secs(30));
+        assert_eq!(pass_rest_at(Some(secs(41)), crate::protocol::Speed::Balanced), secs(164), "the lane-phase PC still rests");
+        // Fast never rests longer; Light from 10 s.
+        assert_eq!(pass_rest_at(Some(secs(300)), crate::protocol::Speed::Fast), secs(30));
+        assert_eq!(pass_rest_at(Some(secs(15)), crate::protocol::Speed::Light), secs(60));
         assert!(!pass_due(Some(secs(31)), true, true, Some(secs(41))), "the next pass of the lane phase storm");
         assert!(pass_due(Some(secs(164)), true, true, Some(secs(41))));
         // The schedule is untouched by the rest.

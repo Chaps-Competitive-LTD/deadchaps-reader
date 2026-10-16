@@ -13,6 +13,22 @@ use serde::{Deserialize, Serialize};
 /// speaks another.
 pub const PROTOCOL: u32 = 1;
 
+/// How hard the reader works the PC, the player's choice: a high-end PC can
+/// read the game as often as it likes, a low-end one needs it spaced out.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Speed {
+    /// High-end PCs: passes come as soon as they are asked for, with no
+    /// pauses while reading and no background priority.
+    Fast,
+    /// Rests after a pass only when the pass was slow (over 30 s).
+    #[default]
+    Balanced,
+    /// Low-end PCs: rests after any pass over 10 s, and pauses longer while
+    /// reading.
+    Light,
+}
+
 /// From the app to the reader.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -26,6 +42,9 @@ pub enum ToReader {
     /// A match that ended without an end line in memory, identified instead
     /// by the Deadlock API's live match lookup.
     AddEnded(EndedMatch),
+    /// The player's reading speed. A reader older than this message logs it
+    /// as not understood and carries on.
+    SetSpeed(Speed),
     /// The answer to [`FromReader::AskValve`].
     Valve { id: u64, has: bool },
     /// Close the game and exit. The reader exits when stdin closes too.
@@ -55,6 +74,8 @@ mod tests {
     fn messages_are_one_short_json_object_each() {
         assert_eq!(serde_json::to_string(&ToReader::SetEnabled(true)).unwrap(), r#"{"set_enabled":true}"#);
         assert_eq!(serde_json::to_string(&ToReader::Stop).unwrap(), r#""stop""#);
+        assert_eq!(serde_json::to_string(&ToReader::SetSpeed(Speed::Fast)).unwrap(), r#"{"set_speed":"fast"}"#);
+        assert_eq!(serde_json::from_str::<ToReader>(r#"{"set_speed":"light"}"#).unwrap(), ToReader::SetSpeed(Speed::Light));
         assert_eq!(
             serde_json::to_string(&ToReader::Valve { id: 3, has: false }).unwrap(),
             r#"{"valve":{"id":3,"has":false}}"#
