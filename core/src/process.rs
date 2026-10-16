@@ -42,6 +42,16 @@ impl GameProcess {
 
     /// Committed, readable, private regions: where the game keeps its heap.
     pub fn private_regions(&self) -> Vec<Region> {
+        self.regions(|size| size <= MAX_REGION)
+    }
+
+    /// The private regions too big to read (over `MAX_REGION`), for the log
+    /// when something is not found.
+    pub fn too_big(&self) -> Vec<Region> {
+        self.regions(|size| size > MAX_REGION)
+    }
+
+    fn regions(&self, keep: impl Fn(usize) -> bool) -> Vec<Region> {
         let mut out = Vec::new();
         let mut addr = 0_usize;
         let mut info = std::mem::MaybeUninit::<MEMORY_BASIC_INFORMATION>::zeroed();
@@ -68,7 +78,7 @@ impl GameProcess {
                 && protect & PAGE_GUARD == 0
                 && protect != PAGE_NOACCESS
                 && READABLE.contains(&(protect & 0xFF))
-                && size <= MAX_REGION
+                && keep(size)
             {
                 out.push(Region { base, size });
             }

@@ -69,6 +69,14 @@ impl GameProcess {
             .unwrap_or_default()
     }
 
+    /// The private regions too big to read (over `MAX_REGION`), for the log
+    /// when something is not found.
+    pub fn too_big(&self) -> Vec<Region> {
+        fs::read_to_string(format!("/proc/{}/maps", self.pid))
+            .map(|maps| too_big_in(&maps))
+            .unwrap_or_default()
+    }
+
     /// The game's mappings by kind, for the log: what the reader takes and
     /// what it leaves out (too big, file-backed, shared, unreadable), so a
     /// log shows where the game's memory sits when the reader finds some
@@ -154,6 +162,22 @@ pub fn layout(maps: &str) -> String {
 /// not backed by a file, with the kernel's own pages left out. This matches
 /// Windows' private committed memory: Wine allocates the game's heap as
 /// anonymous mappings and maps its modules from files.
+/// Readable, private, anonymous mappings over `MAX_REGION`.
+fn too_big_in(maps: &str) -> Vec<Region> {
+    maps.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let (range, perms) = (parts.next()?, parts.next()?.as_bytes());
+            let inode = parts.nth(2)?;
+            let (start, end) = range.split_once('-')?;
+            let (start, end) = (usize::from_str_radix(start, 16).ok()?, usize::from_str_radix(end, 16).ok()?);
+            let size = end.saturating_sub(start);
+            (perms.len() >= 4 && perms[0] == b'r' && perms[3] == b'p' && inode == "0" && size > MAX_REGION)
+                .then_some(Region { base: start, size })
+        })
+        .collect()
+}
+
 pub fn parse_maps(maps: &str) -> Vec<Region> {
     let mut out = Vec::new();
     for line in maps.lines() {

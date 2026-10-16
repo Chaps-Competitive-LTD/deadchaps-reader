@@ -196,6 +196,39 @@ pub fn find(piece: &[u8], base: usize) -> Vec<usize> {
         .collect()
 }
 
+/// Why the object at each place the minimap bounds sit in `piece` was not
+/// taken as the rules object, for the log when a pass finds none: the first
+/// field that does not read as a real one, with its value.
+pub fn misses(piece: &[u8]) -> Vec<String> {
+    let needle = bounds_bytes();
+    memchr::memmem::find_iter(piece, &needle)
+        .map(|at| match at.checked_sub(BOUNDS_AT).and_then(|start| piece.get(start..start + READ_BYTES)) {
+            None => "cut off by the end of the read".to_owned(),
+            Some(obj) => why_not(obj).unwrap_or_else(|| "taken".to_owned()),
+        })
+        .collect()
+}
+
+/// The first field of a candidate that rules it out, or None when it is one.
+fn why_not(obj: &[u8]) -> Option<String> {
+    let f = |off| f32_at(obj, off).unwrap_or(f32::NAN);
+    let u = |off| u32_at(obj, off).unwrap_or(u32::MAX);
+    let checks: [(&str, bool, String); 7] = [
+        ("game start", (0.0..MAX_GAME_TIME).contains(&f(GAME_START)), f(GAME_START).to_string()),
+        ("state", u(STATE) <= 32, u(STATE).to_string()),
+        ("mode", (1..=16).contains(&u(MATCH_MODE)), u(MATCH_MODE).to_string()),
+        ("players", (1..=32).contains(&u(PLAYERS)), u(PLAYERS).to_string()),
+        ("boss kills", u(BOSS_KILLS) <= 64, u(BOSS_KILLS).to_string()),
+        (
+            "rejuvenator credits",
+            u(AMBER_REJUV) <= MAX_REJUV && u(SAPPHIRE_REJUV) <= MAX_REJUV,
+            format!("{}/{}", u(AMBER_REJUV), u(SAPPHIRE_REJUV)),
+        ),
+        ("next boss", (0.0..MAX_GAME_TIME).contains(&f(NEXT_BOSS)), f(NEXT_BOSS).to_string()),
+    ];
+    checks.into_iter().find(|(_, ok, _)| !ok).map(|(name, _, value)| format!("{name} {value}"))
+}
+
 /// The rules from the object's first `READ_BYTES`, when every field reads
 /// as a real one.
 pub fn parse(obj: &[u8]) -> Option<Rules> {
@@ -244,6 +277,29 @@ pub fn parse_ban_ids(elements: &[u8], count: usize) -> Option<Vec<u32>> {
         .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
     ids.iter().all(|id| (1..=MAX_HERO_ID).contains(id)).then_some(ids)
+}
+
+#[cfg(test)]
+mod misses_tests {
+    use super::*;
+
+    #[test]
+    fn a_miss_names_the_field_that_ruled_the_candidate_out() {
+        let mut obj = vec![0_u8; READ_BYTES + 16];
+        obj[BOUNDS_AT..BOUNDS_AT + 24].copy_from_slice(&bounds_bytes());
+        obj[GAME_START..GAME_START + 4].copy_from_slice(&12.5_f32.to_le_bytes());
+        obj[STATE..STATE + 4].copy_from_slice(&7_u32.to_le_bytes());
+        obj[MATCH_MODE..MATCH_MODE + 4].copy_from_slice(&1_u32.to_le_bytes());
+        obj[PLAYERS..PLAYERS + 4].copy_from_slice(&12_u32.to_le_bytes());
+        assert!(parse(&obj).is_some());
+        assert_eq!(misses(&obj), vec!["taken".to_owned()]);
+        obj[MATCH_MODE..MATCH_MODE + 4].copy_from_slice(&0_u32.to_le_bytes());
+        assert!(parse(&obj).is_none());
+        assert_eq!(misses(&obj), vec!["mode 0".to_owned()]);
+        obj[NEXT_BOSS..NEXT_BOSS + 4].copy_from_slice(&(-1.0_f32).to_le_bytes());
+        assert_eq!(misses(&obj), vec!["mode 0".to_owned()], "the first failing field");
+        assert_eq!(misses(&obj[BOUNDS_AT..]), vec!["cut off by the end of the read".to_owned()]);
+    }
 }
 
 #[cfg(test)]

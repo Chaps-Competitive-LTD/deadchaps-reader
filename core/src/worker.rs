@@ -397,6 +397,9 @@ struct Found {
     runs: Vec<Vec<HistoryEntry>>,
     /// Where the game's rules object sits, for the objective timers.
     rules: Vec<usize>,
+    /// Why the places holding the minimap bounds were not the rules object,
+    /// a few of them, for the log when a pass finds none.
+    rules_misses: Vec<String>,
     /// The game's Steam friend records (a full pass only).
     friend_records: Vec<usize>,
 }
@@ -461,7 +464,11 @@ fn read_pieces(
                     }
                 }
                 if throttle && found.rules.len() < 4 {
-                    found.rules.extend(super::rules::find(piece, region.base + off));
+                    let hits = super::rules::find(piece, region.base + off);
+                    if hits.is_empty() && found.rules_misses.len() < 4 {
+                        found.rules_misses.extend(super::rules::misses(piece).into_iter().take(4));
+                    }
+                    found.rules.extend(hits);
                 }
                 if throttle && found.friend_records.len() < MAX_FRIEND_RECORDS {
                     found.friend_records.extend(
@@ -570,16 +577,21 @@ const SETTLE_FOR: Duration = Duration::from_secs(600);
 
 /// How many passes in one match may look for the rules object (the source
 /// of the match timers) when the last one did not find it, a pass every
-/// `MIN_PASS_GAP`.
+/// `MIN_PASS_GAP` ...
 const RULES_TRIES: u32 = 4;
+/// ... and after those, one pass this often for as long as the match lasts
+/// without it. The four tries have missed in a match that followed a replay
+/// watched in the same game session, which left the timers gone for the rest
+/// of the match.
+const RULES_RETRY_EVERY: Duration = Duration::from_secs(300);
 
 /// Whether a pass is wanted to find the rules object: seated in a match
 /// without it, and not yet out of tries. Only a full pass finds the object.
 /// A match's first pass can come before the object exists, or the object
 /// can move, and in a match the scheduled passes are 30 minutes apart, so
 /// without these tries the timers could be missing for most of the match.
-fn rules_pass_wanted(seated: bool, held: bool, tries: u32) -> bool {
-    seated && !held && tries < RULES_TRIES
+fn rules_pass_wanted(seated: bool, held: bool, tries: u32, since_pass: Option<Duration>) -> bool {
+    seated && !held && (tries < RULES_TRIES || since_pass.is_none_or(|gap| gap >= RULES_RETRY_EVERY))
 }
 
 /// How many passes in one match may look for players missing from the
@@ -1623,7 +1635,26 @@ fn run(
                 rules_at = Some(*at);
             } else if in_match {
                 rules_tries += 1;
-                info!("Game memory: no rules object in this pass ({rules_tries} of {RULES_TRIES})");
+                let big: Vec<_> = process.too_big().into_iter().map(|r| r.size >> 20).collect();
+                info!(
+                    "Game memory: no rules object in this pass ({}); the bounds sat in {} place(s){}; regions too big to read: {}",
+                    if rules_tries <= RULES_TRIES {
+                        format!("{rules_tries} of {RULES_TRIES}")
+                    } else {
+                        format!("a retry, every {} s after {RULES_TRIES} tries", RULES_RETRY_EVERY.as_secs())
+                    },
+                    found.rules_misses.len(),
+                    if found.rules_misses.is_empty() {
+                        String::new()
+                    } else {
+                        format!(", turned away for: {}", found.rules_misses.join(" | "))
+                    },
+                    if big.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        big.iter().map(|mb| format!("{mb} MB")).collect::<Vec<_>>().join(", ")
+                    }
+                );
             }
             // A process still starting has nothing in it yet: look again
             // soon, not in ten minutes.
@@ -2083,7 +2114,7 @@ fn run(
         {
             info!("Game memory: no reply for match {match_id} read in {} s", REPLY_FOR.as_secs());
         }
-        if rules_pass_wanted(seated, rules_at.is_some(), rules_tries) {
+        if rules_pass_wanted(seated, rules_at.is_some(), rules_tries, last_pass.map(|at| at.elapsed())) {
             want_pass = true;
             pass_reason = "the timers' rules object not found yet";
         }
@@ -2524,11 +2555,16 @@ mod tests {
         assert_eq!(ending_match(None, Some(106_926_374), Some(106_921_001)), Some(106_926_374));
         assert_eq!(ending_match(Some(7), Some(7), Some(5)), Some(7));
         assert_eq!(ending_match(None, None, None), None);
-        assert!(rules_pass_wanted(true, false, 0), "seated, no timers yet");
-        assert!(rules_pass_wanted(true, false, RULES_TRIES - 1), "one try left");
-        assert!(!rules_pass_wanted(true, false, RULES_TRIES), "out of tries: no storm if it never turns up");
-        assert!(!rules_pass_wanted(true, true, 0), "already held");
-        assert!(!rules_pass_wanted(false, false, 0), "not seated: the hideout or a menu");
+        let last = Some(secs(40));
+        assert!(rules_pass_wanted(true, false, 0, last), "seated, no timers yet");
+        assert!(rules_pass_wanted(true, false, RULES_TRIES - 1, last), "one try left");
+        assert!(!rules_pass_wanted(true, false, RULES_TRIES, last), "out of quick tries: no storm if it never turns up");
+        assert!(
+            rules_pass_wanted(true, false, RULES_TRIES + 3, Some(RULES_RETRY_EVERY)),
+            "but looked for again every five minutes for the rest of the match"
+        );
+        assert!(!rules_pass_wanted(true, true, 0, last), "already held");
+        assert!(!rules_pass_wanted(false, false, 0, last), "not seated: the hideout or a menu");
         assert!(settling_pass_wanted(secs(8), false), "the main menu, nobody read yet");
         assert!(settling_pass_wanted(secs(599), false), "still looking");
         assert!(!settling_pass_wanted(secs(600), false), "gave up: the idle passes take over");
