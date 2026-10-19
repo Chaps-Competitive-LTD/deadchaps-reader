@@ -1,5 +1,9 @@
 # DeadChaps reader
 
+## 1.0.10
+
+- Tells the Companion which team holds the rejuvenator, so it can clip your team taking the mid boss.
+
 ## 1.0.9
 
 - After a match is cancelled, its players are no longer listed as your party in the hideout.

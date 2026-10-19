@@ -83,6 +83,11 @@ pub struct Objectives {
     /// `rejuv_claim`).
     pub rejuv_claimed: Option<f32>,
     pub read_unix_ms: u64,
+    /// The rejuvenator credits each team holds, team 2's then team 3's: the
+    /// team whose credits leave zero took the mid boss (the Companion clips
+    /// it). Absent from a reader before 1.0.10.
+    #[serde(default)]
+    pub rejuv_credits: [u32; 2],
 }
 
 /// A match the game ended, as its own rules object says. Reported to the

@@ -2368,6 +2368,7 @@ fn run(
                 boss_kills: r.boss_kills,
                 next_boss: r.next_boss,
                 rejuv_claimed: rejuv_at,
+                rejuv_credits: r.rejuv,
                 read_unix_ms: SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
