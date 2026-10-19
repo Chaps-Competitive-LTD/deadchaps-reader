@@ -3249,7 +3249,9 @@ mod tests {
             ..MemoryView::default()
         };
         assert!(view.in_hideout());
-        assert_eq!(view.party().len(), 6, "what the card showed");
+        // Six before 1.0.9; the two past a party's seats (3/7, 3/10) are
+        // left out now even with no end line known (`in_a_match_seat`).
+        assert_eq!(view.party().len(), 4, "the card showed six");
         view.match_players = players::merge_players(
             vec![at(US, 2, 4, 1, true)],
         );
@@ -3276,7 +3278,8 @@ mod tests {
             ..MemoryView::default()
         };
         assert!(view.in_hideout(), "what the reader made of it");
-        assert_eq!(view.party().len(), 5, "no end known: as before");
+        // Five before 1.0.9; 3/7 and 3/11 sit past a party's seats.
+        assert_eq!(view.party().len(), 3, "no end known: the seats tell part of it");
         view.game_end = Some(GameEnd { match_id: 109_128_693, winner: 2 });
         assert!(view.party().is_empty(), "the game ended it: these are its objects");
         // Later: ours back at level 1, two leftovers still read.
@@ -3286,11 +3289,55 @@ mod tests {
             at(1_024_054_686, 3, 11, 34, false),
         ];
         assert_eq!(view.party().iter().map(|p| p.account_id).collect::<Vec<_>>(), vec![US]);
-        // An older match's end says nothing about this one.
+        // An older match's end says nothing about this one, but 3/7 and
+        // 3/11 sit past a party's seats (three before 1.0.9).
         view.game_end = Some(GameEnd { match_id: 109_000_000, winner: 2 });
-        assert_eq!(view.party().len(), 3);
+        assert_eq!(view.party().len(), 1);
         view.last_match_end = Some(MatchEnd { lobby_id: 0, match_id: 109_128_693 });
         assert_eq!(view.party().len(), 1, "the end line does it too");
+    }
+
+    /// A match cancelled after the hero vote: no end line, no game end, and
+    /// (after a restart of the app) no roster, so only the seats tell. As
+    /// reported: alone in the hideout, the Lobby listed four of the cancelled
+    /// lobby as the party, one of them from the other team.
+    #[test]
+    fn a_cancelled_matchs_players_are_not_the_party() {
+        let laned = |account_id, team, slot, lane| MatchPlayer { lane: Some(lane), ..at(account_id, team, slot, 1, false) };
+        let us = seated(1_161_088_555, 2, 1, true);
+        let view = MemoryView {
+            match_players: vec![
+                us.clone(),
+                laned(441_298_411, 2, 4, 6),
+                laned(164_926_713, 3, 8, 1),
+                laned(1_024_054_686, 2, 5, 4),
+                laned(165_193_962, 2, 6, 1),
+            ],
+            ..MemoryView::default()
+        };
+        assert!(view.in_hideout(), "five read, no match named: the hideout's shape");
+        assert_eq!(view.party().iter().map(|p| p.account_id).collect::<Vec<_>>(), vec![us.account_id]);
+        // Past a party's seats with no lane read: still a match seat.
+        let far = MemoryView {
+            match_players: vec![us.clone(), at(164_926_713, 3, 9, 1, false)],
+            ..MemoryView::default()
+        };
+        assert_eq!(far.party().len(), 1);
+        // A real party in the hideout, as logged on 16 Oct 2026 (team 2,
+        // slots 0 to 5, no lane), is kept whole, and the leftovers read
+        // beside it after a match (with lanes) are not.
+        let party = MemoryView {
+            match_players: vec![
+                at(1, 2, 0, 1, false),
+                at(2, 2, 3, 1, false),
+                at(3, 2, 4, 1, false),
+                MatchPlayer { lane: None, ..seated(1_161_088_555, 2, 5, true) },
+                laned(5, 2, 1, 6),
+                laned(6, 2, 6, 4),
+            ],
+            ..MemoryView::default()
+        };
+        assert_eq!(party.party().len(), 4);
     }
 
     /// A party of three in the hideout, and two spectators of a custom match

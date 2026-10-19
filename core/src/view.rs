@@ -245,6 +245,7 @@ impl MemoryView {
             .match_players
             .iter()
             .filter(|p| p.is_us || p.team != SPECTATORS)
+            .filter(|p| p.is_us || !in_a_match_seat(p))
             .filter(|p| !match_leftover(p, self.match_roster.as_ref(), over))
             .cloned()
             .collect();
@@ -303,6 +304,17 @@ pub(crate) fn match_leftover(p: &MatchPlayer, roster: Option<&(u64, Vec<MatchPla
         && players
             .iter()
             .any(|q| reads_as(p, q) || (p.level > 1 && same_seat(p, q)))
+}
+
+/// Whether `p` sits the way a match seats its players, which a hideout party
+/// never does: with a lane (the game gives one only in a match, 1, 4 or 6 in
+/// a 6v6, and none in the hideout), or past any seat a party uses. A match
+/// cancelled after the hero vote prints no end line, so `match_leftover`
+/// cannot tell its players' objects, and the game keeps them until the next
+/// match: a player's Lobby tab listed four of that lobby, an enemy among
+/// them, as their party, through a restart of the app (19 Oct 2026).
+pub(crate) fn in_a_match_seat(p: &MatchPlayer) -> bool {
+    p.lane.is_some() || usize::from(p.slot) > PARTY_MAX
 }
 
 /// The same player in the same seat on the same hero, whatever the numbers.

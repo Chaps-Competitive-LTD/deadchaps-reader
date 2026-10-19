@@ -1,5 +1,9 @@
 # DeadChaps reader
 
+## 1.0.9
+
+- After a match is cancelled, its players are no longer listed as your party in the hideout.
+
 ## 1.0.8
 
 - The Light reading speed is now called Slow.
