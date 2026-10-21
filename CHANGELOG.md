@@ -1,5 +1,9 @@
 # DeadChaps reader
 
+## 1.0.13
+
+- Reads the whole game less often while nothing is happening, such as a game left open in the menus, and looks for the match timers a little later in the draft, when they are there to find. Fewer full reads in all, so less of your processor.
+
 ## 1.0.12
 
 - Searches the game's memory several times faster, so each full read of the game uses much less of your processor, which matters most on lower-end PCs. It finds exactly what it found before.

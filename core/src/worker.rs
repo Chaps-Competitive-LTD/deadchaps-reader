@@ -64,6 +64,25 @@ const MAX_FRIEND_RECORDS: usize = 4096;
 const IDLE_PASS_EVERY: Duration = Duration::from_secs(600);
 /// ... and this often in one, where the kept pieces carry everything.
 const MATCH_PASS_EVERY: Duration = Duration::from_secs(1800);
+/// Out of a match, each scheduled pass in a row that finds nothing new
+/// doubles the wait for the next, up to this (21 Oct 2026). A week of
+/// one PC's logs: scheduled passes were 47% of the reader's CPU, and 44 of
+/// them ran back to back, 10 GB every 10 minutes for seven hours of a game
+/// left open. Anything happening (an event asking for a pass, new history,
+/// a replay address, Valve's reply) puts it back to `IDLE_PASS_EVERY`.
+const IDLE_PASS_MOST: Duration = Duration::from_secs(3600);
+
+/// The idle schedule after `quiet` scheduled passes in a row found nothing
+/// new: 10, 20, 40, then 60 minutes.
+fn idle_every(quiet: u32) -> Duration {
+    IDLE_PASS_EVERY.saturating_mul(1 << quiet.min(3)).min(IDLE_PASS_MOST)
+}
+
+/// The quiet count after a pass: back to none when the pass was asked for or
+/// found something new, one more otherwise.
+fn next_quiet(quiet: u32, asked: bool, found_new: bool) -> u32 {
+    if asked || found_new { 0 } else { quiet.saturating_add(1) }
+}
 /// A pass something asked for (a match ended, the pieces lost their records)
 /// still waits this long after the last one ...
 const MIN_PASS_GAP: Duration = Duration::from_secs(30);
@@ -623,6 +642,14 @@ const SETTLE_FOR: Duration = Duration::from_secs(600);
 /// of the match timers) when the last one did not find it, a pass every
 /// `MIN_PASS_GAP` ...
 const RULES_TRIES: u32 = 4;
+/// The first pass asked for only to find the rules object waits until the
+/// lobby has been seated this long (21 Oct 2026). Across a week of logged
+/// matches, passes 5 to 6 s after seating missed it about as often as they
+/// found it, and most passes from 24 s on found it; a miss costs another
+/// whole-game pass. Seating comes during the draft, before the match clock
+/// runs, so the timers lose nothing by it. Passes asked for anything else
+/// still look for it.
+const RULES_FIRST_AFTER: Duration = Duration::from_secs(25);
 /// ... and after those, one pass this often for as long as the match lasts
 /// without it. The four tries have missed in a match that followed a replay
 /// watched in the same game session, which left the timers gone for the rest
@@ -634,8 +661,15 @@ const RULES_RETRY_EVERY: Duration = Duration::from_secs(300);
 /// A match's first pass can come before the object exists, or the object
 /// can move, and in a match the scheduled passes are 30 minutes apart, so
 /// without these tries the timers could be missing for most of the match.
-fn rules_pass_wanted(seated: bool, held: bool, tries: u32, since_pass: Option<Duration>) -> bool {
-    seated && !held && (tries < RULES_TRIES || since_pass.is_none_or(|gap| gap >= RULES_RETRY_EVERY))
+fn rules_pass_wanted(
+    seated_for: Option<Duration>,
+    held: bool,
+    tries: u32,
+    since_pass: Option<Duration>,
+) -> bool {
+    seated_for.is_some_and(|s| s >= RULES_FIRST_AFTER)
+        && !held
+        && (tries < RULES_TRIES || since_pass.is_none_or(|gap| gap >= RULES_RETRY_EVERY))
 }
 
 /// How many passes in one match may look for players missing from the
@@ -1180,14 +1214,17 @@ fn reply_pass_wanted(waiting: Option<(u64, Duration)>, replied: &[u64], match_on
 }
 
 /// Whether a full pass runs now: the first for a game, then one every
-/// `IDLE_PASS_EVERY`, or `MATCH_PASS_EVERY` in a fully read match, or sooner
-/// when asked, but never within `pass_rest` of the last, which took `took`.
-fn pass_due(since_last: Option<Duration>, asked: bool, in_match: bool, took: Option<Duration>) -> bool {
-    let every = if in_match {
-        MATCH_PASS_EVERY
-    } else {
-        IDLE_PASS_EVERY
-    };
+/// `idle` (`idle_every`), or `MATCH_PASS_EVERY` in a fully read match, or
+/// sooner when asked, but never within `pass_rest` of the last, which took
+/// `took`.
+fn pass_due(
+    since_last: Option<Duration>,
+    asked: bool,
+    in_match: bool,
+    took: Option<Duration>,
+    idle: Duration,
+) -> bool {
+    let every = if in_match { MATCH_PASS_EVERY } else { idle };
     since_last.is_none_or(|gap| gap >= every || (asked && gap >= pass_rest(took)))
 }
 
@@ -1392,6 +1429,10 @@ fn run(
     // Whether the last pass kept pieces holding history or an end line.
     let mut hot_held_history = false;
     let mut last_pass: Option<Instant> = None;
+    // Scheduled passes in a row that found nothing new (`idle_every`).
+    let mut quiet_passes = 0_u32;
+    // Since when the lobby is seated in a match (`RULES_FIRST_AFTER`).
+    let mut seated_since: Option<Instant> = None;
     // The in-RAM share last logged (`regions_to_read`), and whether a pass
     // that read only RAM this match missed the rules object, so the next
     // reads everything.
@@ -1620,7 +1661,13 @@ fn run(
         let players_pass_asked =
             want_for_players && !player_pass_waits(seating_from.map(|at| at.elapsed()), sweeping);
         let asked = want_pass || players_pass_asked;
-        if pass_due(last_pass.map(|at| at.elapsed()), asked, full_match, last_pass_took) {
+        if pass_due(
+            last_pass.map(|at| at.elapsed()),
+            asked,
+            full_match,
+            last_pass_took,
+            idle_every(quiet_passes),
+        ) {
             let reason_now = if asked { pass_reason } else { "the schedule" };
             let quiet = Background::begin();
             let started = Instant::now();
@@ -1766,6 +1813,18 @@ fn run(
             last_pass_took = Some(started.elapsed());
             pass_ran = true;
             hot_held_history = !found.entries.is_empty() || !found.ends.is_empty();
+            let found_new = {
+                let view = lock(&shared.view);
+                found.entries.iter().any(|e| !view.entries.iter().any(|k| k.match_id == e.match_id))
+            } || found.salts_urls.iter().any(|url| !salts_sent.contains(url));
+            let quiet_before = quiet_passes;
+            quiet_passes = next_quiet(quiet_passes, asked, found_new);
+            if quiet_passes > quiet_before && idle_every(quiet_passes) > idle_every(quiet_before) {
+                info!(
+                    "Game memory: {quiet_passes} scheduled passes in a row found nothing new; the next out of a match in {} min unless something happens",
+                    idle_every(quiet_passes).as_secs() / 60
+                );
+            }
             if let Some(at) = found.rules.first() {
                 if rules_at.is_none() {
                     info!("Game memory: rules object found (the timers' source)");
@@ -2253,6 +2312,11 @@ fn run(
         let running_or_playing = running || playing_seen;
         let match_named = named.is_some();
         let seated = seated_in_match(&match_players, match_named, running_or_playing);
+        if seated {
+            seated_since.get_or_insert_with(Instant::now);
+        } else {
+            seated_since = None;
+        }
         // Only once the console names the match: a loading match is seated
         // before that, and `last_started` then still names the last one.
         if seated && let Some(id) = named {
@@ -2272,7 +2336,12 @@ fn run(
         {
             info!("Game memory: no reply for match {match_id} read in {} s", REPLY_FOR.as_secs());
         }
-        if rules_pass_wanted(seated, rules_at.is_some(), rules_tries, last_pass.map(|at| at.elapsed())) {
+        if rules_pass_wanted(
+            seated_since.map(|at| at.elapsed()),
+            rules_at.is_some(),
+            rules_tries,
+            last_pass.map(|at| at.elapsed()),
+        ) {
             want_pass = true;
             pass_reason = "the timers' rules object not found yet";
         }
@@ -2696,7 +2765,7 @@ mod tests {
     #[test]
     fn a_full_pass_runs_first_then_on_events_or_seldom() {
         let secs = Duration::from_secs;
-        assert!(pass_due(None, false, false, None), "a new game's first pass");
+        assert!(pass_due(None, false, false, None, IDLE_PASS_EVERY), "a new game's first pass");
         assert!(reply_pass_wanted(Some((105_808_982, secs(20))), &[], false), "the match just ended");
         assert!(!reply_pass_wanted(Some((105_808_982, secs(20))), &[105_808_982], false), "its reply is read");
         assert!(!reply_pass_wanted(Some((105_808_982, secs(300))), &[], false), "gave up after five minutes");
@@ -2724,39 +2793,42 @@ mod tests {
         assert_eq!(ending_match(Some(7), Some(7), Some(5)), Some(7));
         assert_eq!(ending_match(None, None, None), None);
         let last = Some(secs(40));
-        assert!(rules_pass_wanted(true, false, 0, last), "seated, no timers yet");
-        assert!(rules_pass_wanted(true, false, RULES_TRIES - 1, last), "one try left");
-        assert!(!rules_pass_wanted(true, false, RULES_TRIES, last), "out of quick tries: no storm if it never turns up");
+        const SEATED: Duration = Duration::from_secs(60);
+        assert!(rules_pass_wanted(Some(SEATED), false, 0, last), "seated, no timers yet");
+        assert!(rules_pass_wanted(Some(SEATED), false, RULES_TRIES - 1, last), "one try left");
+        assert!(!rules_pass_wanted(Some(SEATED), false, RULES_TRIES, last), "out of quick tries: no storm if it never turns up");
         assert!(
-            rules_pass_wanted(true, false, RULES_TRIES + 3, Some(RULES_RETRY_EVERY)),
+            rules_pass_wanted(Some(SEATED), false, RULES_TRIES + 3, Some(RULES_RETRY_EVERY)),
             "but looked for again every five minutes for the rest of the match"
         );
-        assert!(!rules_pass_wanted(true, true, 0, last), "already held");
-        assert!(!rules_pass_wanted(false, false, 0, last), "not seated: the hideout or a menu");
+        assert!(!rules_pass_wanted(Some(SEATED), true, 0, last), "already held");
+        assert!(!rules_pass_wanted(None, false, 0, last), "not seated: the hideout or a menu");
+        assert!(!rules_pass_wanted(Some(secs(6)), false, 0, last), "seated 6 s: too soon, it is often not there yet");
+        assert!(rules_pass_wanted(Some(RULES_FIRST_AFTER), false, 0, last), "seated 25 s");
         assert!(settling_pass_wanted(secs(8), false), "the main menu, nobody read yet");
         assert!(settling_pass_wanted(secs(599), false), "still looking");
         assert!(!settling_pass_wanted(secs(600), false), "gave up: the idle passes take over");
         assert!(!settling_pass_wanted(secs(30), true), "our player was read");
         assert!(
-            !pass_due(Some(secs(120)), false, false, None),
+            !pass_due(Some(secs(120)), false, false, None, IDLE_PASS_EVERY),
             "two minutes is not a reason"
         );
         assert!(
-            pass_due(Some(secs(600)), false, false, None),
+            pass_due(Some(secs(600)), false, false, None, IDLE_PASS_EVERY),
             "ten minutes out of a match"
         );
         assert!(
-            !pass_due(Some(secs(600)), false, true, None),
+            !pass_due(Some(secs(600)), false, true, None, IDLE_PASS_EVERY),
             "in a match the hot pieces carry it"
         );
-        assert!(pass_due(Some(secs(1800)), false, true, None));
-        assert!(!pass_due(Some(secs(29)), true, true, None), "asked, but too soon");
+        assert!(pass_due(Some(secs(1800)), false, true, None, IDLE_PASS_EVERY));
+        assert!(!pass_due(Some(secs(29)), true, true, None, IDLE_PASS_EVERY), "asked, but too soon");
         assert!(
-            pass_due(Some(secs(30)), true, true, None),
+            pass_due(Some(secs(30)), true, true, None, IDLE_PASS_EVERY),
             "asked: a queue, a match named, a match ended"
         );
         // A mid-range PC's pass (15 to 20 s) keeps the 30 s rest ...
-        assert!(pass_due(Some(secs(30)), true, true, Some(secs(18))));
+        assert!(pass_due(Some(secs(30)), true, true, Some(secs(18)), IDLE_PASS_EVERY));
         // ... and a PC short of memory, where a pass took 41 s, rests 164 s.
         assert_eq!(pass_rest_at(Some(secs(41)), crate::protocol::Speed::Slow), secs(164));
         // Balanced, the default: a high-end PC's 23 s pass keeps the 30 s
@@ -2766,10 +2838,10 @@ mod tests {
         // Fast never rests longer; Slow from 10 s.
         assert_eq!(pass_rest_at(Some(secs(300)), crate::protocol::Speed::Fast), secs(30));
         assert_eq!(pass_rest_at(Some(secs(15)), crate::protocol::Speed::Slow), secs(60));
-        assert!(!pass_due(Some(secs(31)), true, true, Some(secs(41))), "the next pass of the lane phase storm");
-        assert!(pass_due(Some(secs(164)), true, true, Some(secs(41))));
+        assert!(!pass_due(Some(secs(31)), true, true, Some(secs(41)), IDLE_PASS_EVERY), "the next pass of the lane phase storm");
+        assert!(pass_due(Some(secs(164)), true, true, Some(secs(41)), IDLE_PASS_EVERY));
         // The schedule is untouched by the rest.
-        assert!(pass_due(Some(secs(1800)), false, true, Some(secs(52))));
+        assert!(pass_due(Some(secs(1800)), false, true, Some(secs(52)), IDLE_PASS_EVERY));
     }
 
     #[test]
@@ -2787,6 +2859,29 @@ mod tests {
         // a quick read keeps the floors
         assert!(!sweep_due(Some(secs(20)), 0, false, Some(secs(3)), Some(secs(1))));
         assert!(!sweep_due(Some(secs(120)), 0, false, Some(secs(24)), Some(secs(1))));
+    }
+
+    /// Out of a match, scheduled passes that find nothing new space out to
+    /// an hour, and anything happening brings them back to ten minutes; in
+    /// a match nothing changes.
+    #[test]
+    fn idle_passes_back_off_while_nothing_new_turns_up() {
+        let secs = Duration::from_secs;
+        let waits: Vec<u64> = (0..6).map(|q| idle_every(q).as_secs()).collect();
+        assert_eq!(waits, vec![600, 1200, 2400, 3600, 3600, 3600]);
+        assert_eq!(next_quiet(0, false, false), 1, "a scheduled pass that found nothing");
+        assert_eq!(next_quiet(3, false, false), 4);
+        assert_eq!(next_quiet(3, true, false), 0, "an event asked for it");
+        assert_eq!(next_quiet(3, false, true), 0, "it found new history or a replay address");
+        // Three quiet passes: the next comes at 60 min, not 10 ...
+        assert!(!pass_due(Some(secs(600)), false, false, None, idle_every(3)));
+        assert!(!pass_due(Some(secs(3599)), false, false, None, idle_every(3)));
+        assert!(pass_due(Some(secs(3600)), false, false, None, idle_every(3)));
+        // ... while an asked pass still runs after the usual rest ...
+        assert!(pass_due(Some(secs(30)), true, false, None, idle_every(3)));
+        // ... and a match keeps its own cadence.
+        assert!(pass_due(Some(secs(1800)), false, true, None, idle_every(3)));
+        assert!(!pass_due(Some(secs(1799)), false, true, None, idle_every(0)));
     }
 
     #[test]

@@ -166,7 +166,7 @@ fn replay_until(s: &Seating, new: bool, some: f64, all: f64, until: f64) -> Outc
             (Some(a), Some(b)) => Some(d(t - a.max(b))),
             (a, b) => a.or(b).map(|e| d(t - e)),
         };
-        if pass_due(last_full.map(|e| d(t - e)), want, false, pass_took.filter(|_| new).map(d)) {
+        if pass_due(last_full.map(|e| d(t - e)), want, false, pass_took.filter(|_| new).map(d), IDLE_PASS_EVERY) {
             let p = observed.next().or_else(|| s.passes.last()).expect("a pass");
             let start = t;
             t += p.1;
@@ -362,7 +362,7 @@ fn a_late_pop_is_read_within_a_sweep_or_two() {
     // minutes after the one before.
     let old_window = Duration::from_secs(300);
     assert!(!old_seating_pass_wanted(Some(old_window), 0));
-    assert!(!pass_due(Some(Duration::from_secs(300)), false, false, None));
+    assert!(!pass_due(Some(Duration::from_secs(300)), false, false, None, IDLE_PASS_EVERY));
     // The new: the queue stopping is the sign, and the replay from it is
     // the same as from the party going.
     let new = replay(s, true, 51.0, 51.0);
