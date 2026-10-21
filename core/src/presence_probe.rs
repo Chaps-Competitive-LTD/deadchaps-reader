@@ -38,8 +38,10 @@ pub fn queueing(snippets: &[String]) -> bool {
 /// on the quick pass: waiting for the next full pass leaves the queue state
 /// minutes behind.
 pub fn has_presence(buf: &[u8]) -> bool {
-    memchr::memmem::find(buf, KEY).is_some()
+    key().find(buf).is_some()
 }
+
+crate::scan::static_finder!(key, KEY);
 const BEFORE: usize = 48;
 const AFTER: usize = 208;
 /// Snippets kept per pass: a loaded localisation file can hold the key many
@@ -55,7 +57,9 @@ pub fn snippets(buf: &[u8], account: Option<u32>) -> Vec<String> {
 }
 
 fn around(buf: &[u8], key: &[u8], account: Option<u32>) -> Vec<String> {
-    memchr::memmem::find_iter(buf, key)
+    let finder = crate::scan::finder(key);
+    finder
+        .find_iter(buf)
         .filter(|&at| account.is_none_or(|a| ours_near(buf, at, a)))
         .take(AT_MOST)
         .map(|at| {

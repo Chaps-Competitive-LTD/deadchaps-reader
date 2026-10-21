@@ -38,6 +38,7 @@ pub mod procs;
 pub mod protocol;
 pub mod rules;
 pub mod salts_probe;
+pub(crate) mod scan;
 #[cfg(feature = "process")]
 mod store;
 pub mod view;
@@ -295,26 +296,38 @@ fn digits_before(buf: &[u8], end: usize) -> Option<u64> {
 
 /// Every `Lobby <id> for Match <id> destroyed` line in `buf`, oldest first.
 pub fn find_match_ends(buf: &[u8]) -> Vec<MatchEnd> {
-    find_lobby_lines(buf, END_TAIL)
+    find_match_lines(buf).0
 }
 
 /// Every `Lobby <id> for Match <id> created` line in `buf`, oldest first:
 /// the match the game is in, named as it begins.
 pub fn find_match_starts(buf: &[u8]) -> Vec<MatchEnd> {
-    find_lobby_lines(buf, START_TAIL)
+    find_match_lines(buf).1
 }
 
-fn find_lobby_lines(buf: &[u8], tail: &[u8]) -> Vec<MatchEnd> {
-    let mut out = Vec::new();
-    for at in memchr::memmem::find_iter(buf, END_MIDDLE) {
+scan::static_finder!(lobby_middle, END_MIDDLE);
+
+/// The ends and the starts together, from one search of `buf` (a full pass
+/// searched it twice for the same words).
+pub fn find_match_lines(buf: &[u8]) -> (Vec<MatchEnd>, Vec<MatchEnd>) {
+    let mut ends = Vec::new();
+    let mut starts = Vec::new();
+    for at in lobby_middle().find_iter(buf) {
         let ids_start = at + END_MIDDLE.len();
         let ids_end = buf[ids_start..]
             .iter()
             .position(|b| !b.is_ascii_digit())
             .map_or(buf.len(), |i| ids_start + i);
-        if ids_end == ids_start || !buf[ids_end..].starts_with(tail) {
+        if ids_end == ids_start {
             continue;
         }
+        let out = if buf[ids_end..].starts_with(END_TAIL) {
+            &mut ends
+        } else if buf[ids_end..].starts_with(START_TAIL) {
+            &mut starts
+        } else {
+            continue;
+        };
         let Some(match_id) = std::str::from_utf8(&buf[ids_start..ids_end])
             .ok()
             .and_then(|s| s.parse::<u64>().ok())
@@ -333,7 +346,7 @@ fn find_lobby_lines(buf: &[u8], tail: &[u8]) -> Vec<MatchEnd> {
             out.push(MatchEnd { lobby_id, match_id });
         }
     }
-    out
+    (ends, starts)
 }
 
 #[cfg(test)]

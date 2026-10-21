@@ -23,10 +23,12 @@ const HEAD: &[u8] = b"http://replay";
 const CLUSTER_MAX: usize = 8;
 const NAME_MAX: usize = 48;
 
+crate::scan::static_finder!(host_tail, HOST_TAIL);
+
 /// Every replay address in `buf`, whole and once each, in the order found.
 pub fn urls(buf: &[u8]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
-    for at in memchr::memmem::find_iter(buf, HOST_TAIL) {
+    for at in host_tail().find_iter(buf) {
         // Back to "http://replay", at most a cluster id away.
         let Some(start) = (at.saturating_sub(HEAD.len() + CLUSTER_MAX)
             ..=at.saturating_sub(HEAD.len()))
@@ -92,8 +94,16 @@ pub fn replies(buf: &[u8], base: usize) -> Vec<Reply> {
         let b = &buf[i..i + 4];
         u32::from_le_bytes([b[0], b[1], b[2], b[3]])
     };
-    let mut i = (16 - base % 16) % 16;
-    while i + 48 <= buf.len() {
+    // Found by the reply's fixed middle (all fields, nothing, OK) rather than
+    // by testing every 16 bytes of the game (21 Oct 2026: 38 to 104 ms per
+    // GB that way). The same places pass the same tests.
+    for mid in crate::scan::all_at(reply_middle(), buf) {
+        let Some(i) = mid.checked_sub(16) else {
+            continue;
+        };
+        if !(base + i).is_multiple_of(16) || i + 48 > buf.len() {
+            continue;
+        }
         if (0x7ff0..=0x7fff).contains(&word(i + 4))
             && word(i + 8) == 0
             && word(i + 12) == 0
@@ -115,9 +125,18 @@ pub fn replies(buf: &[u8], base: usize) -> Vec<Reply> {
                 end_time: word(i + 44) - AFTER_END,
             });
         }
-        i += 16;
     }
     out
+}
+
+fn reply_middle() -> &'static memchr::memmem::Finder<'static> {
+    static F: std::sync::OnceLock<memchr::memmem::Finder<'static>> = std::sync::OnceLock::new();
+    F.get_or_init(|| {
+        let mut needle = [0_u8; 12];
+        needle[..4].copy_from_slice(&ALL_FIELDS.to_le_bytes());
+        needle[8..].copy_from_slice(&RESULT_OK.to_le_bytes());
+        crate::scan::finder(&needle)
+    })
 }
 
 /// The match a reply is for: the history record that started when the
@@ -159,7 +178,8 @@ pub fn find_lobby(buf: &[u8], base: usize, lobby_id: u64, match_id: u64) -> Vec<
         buf.get(i..i + 4)
             .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     };
-    memchr::memmem::find_iter(buf, &needle)
+    crate::scan::finder(&needle)
+        .find_iter(buf)
         .filter(|at| (base + at).is_multiple_of(8))
         .take(3)
         .map(|at| {
@@ -307,6 +327,95 @@ pub fn url(match_id: u64, cluster: u32, metadata_salt: u32) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The every-16-bytes loop the fast search replaced (to 21 Oct 2026).
+    fn replies_by_step(buf: &[u8], base: usize) -> Vec<Reply> {
+        let mut out = Vec::new();
+        let word = |i: usize| {
+            let b = &buf[i..i + 4];
+            u32::from_le_bytes([b[0], b[1], b[2], b[3]])
+        };
+        let mut i = (16 - base % 16) % 16;
+        while i + 48 <= buf.len() {
+            if (0x7ff0..=0x7fff).contains(&word(i + 4))
+                && word(i + 8) == 0
+                && word(i + 12) == 0
+                && word(i + 16) == ALL_FIELDS
+                && word(i + 20) == 0
+                && word(i + 24) == RESULT_OK
+                && word(i + 32) != 0
+                && (1..=4000).contains(&word(i + 40))
+                && TIMES.contains(&word(i + 36))
+                && TIMES.contains(&word(i + 44))
+                && word(i + 36) > word(i + 44)
+            {
+                out.push(Reply {
+                    at: base + i,
+                    replay_salt: word(i + 28),
+                    metadata_salt: word(i + 32),
+                    cluster: word(i + 40),
+                    start_time: word(i + 36) - VALID_FOR,
+                    end_time: word(i + 44) - AFTER_END,
+                });
+            }
+            i += 16;
+        }
+        out
+    }
+
+    /// The fast search finds every reply the 16-byte loop did, at every
+    /// alignment of the read and of the reply, with near misses and bare
+    /// middles scattered between.
+    #[test]
+    fn the_fast_search_finds_what_the_step_loop_found() {
+        let mut seed = 0xD1B5_4A32_D192_ED03_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let reply = |cluster: u32, good: bool| {
+            let mut r = [0_u8; 48];
+            let mut put = |i: usize, v: u32| r[i..i + 4].copy_from_slice(&v.to_le_bytes());
+            put(0, 0x1234_5678);
+            put(4, 0x7ff6);
+            put(16, ALL_FIELDS);
+            put(24, RESULT_OK);
+            put(28, 777);
+            put(32, if good { 999 } else { 0 });
+            put(36, 1_790_000_900);
+            put(40, cluster);
+            put(44, 1_790_000_100);
+            r
+        };
+        let mut middle = [0_u8; 12];
+        middle[..4].copy_from_slice(&ALL_FIELDS.to_le_bytes());
+        middle[8..].copy_from_slice(&RESULT_OK.to_le_bytes());
+        let mut total = 0;
+        for round in 0_usize..24 {
+            let len = 32 * 1024 + round * 4;
+            let mut buf: Vec<u8> = (0..len).map(|_| (next() >> 24) as u8).collect();
+            for k in 0..60_u32 {
+                let at = usize::try_from(next() % (len as u64 - 64)).unwrap();
+                match k % 3 {
+                    0 => buf[at..at + 48].copy_from_slice(&reply(k + 1, true)),
+                    1 => buf[at..at + 48].copy_from_slice(&reply(7, false)),
+                    _ => buf[at..at + 12].copy_from_slice(&middle),
+                }
+                // and some on the 16-byte grid of this read
+                let grid = (at & !15) + (16 - round % 16) % 16;
+                if grid + 48 <= len && k % 4 == 0 {
+                    buf[grid..grid + 48].copy_from_slice(&reply(3, true));
+                }
+            }
+            let base = 0x1000_0000 + round;
+            let fast = replies(&buf, base);
+            assert_eq!(fast, replies_by_step(&buf, base), "round {round}");
+            total += fast.len();
+        }
+        assert!(total > 100, "the planted replies were found: {total}");
+    }
 
     #[test]
     fn replay_addresses_are_lifted_whole_and_once() {

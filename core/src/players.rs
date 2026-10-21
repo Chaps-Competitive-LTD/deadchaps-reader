@@ -84,11 +84,15 @@ const RANK_BADGE: usize = 0x340;
 // Build 25611908 (schema): m_bUltimateTrained 0x7C, cooldown start 0x80 and
 // end 0x84 (game time in seconds), m_bHasRejuvenator 0x88 opens four flags,
 // m_iHeroDamage 0x8C.
+// Client 6801 (20 Oct 2026, schema in client.dll on disk): Valve added
+// m_flUltimateStoppedCooldownRemaining at 0x88, after the cooldown pair, so the
+// four flags moved to 0x8C and m_iHeroDamage to 0x90. Every other field read
+// here kept its offset.
 const ULT_TRAINED: usize = 0x7C;
 const ULT_START: usize = 0x80;
 const ULT_END: usize = 0x84;
-const ULT_FLAGS: usize = 0x88;
-const HERO_DAMAGE: usize = 0x8C;
+const ULT_FLAGS: usize = 0x8C;
+const HERO_DAMAGE: usize = 0x90;
 /// Game time runs from the map loading; a match is well under a day.
 const MAX_GAME_TIME: f32 = 86_400.0;
 /// The longest ultimate cooldown in the game is far below this.
@@ -346,6 +350,8 @@ fn read_name(buf: &[u8], off: usize) -> Option<String> {
     std::str::from_utf8(name).ok().map(str::to_owned)
 }
 
+crate::scan::static_finder!(steam_high, &STEAM_HIGH.to_le_bytes());
+
 /// Every player object in `buf`, as (offset, player). Steam ids are 8-aligned
 /// inside the object, so only every eighth byte is tested, and the test itself
 /// is the top half of a Steam id, which almost nothing else in memory carries.
@@ -363,14 +369,14 @@ pub fn find_players_watching(
     rejected: &mut Vec<Rejected>,
 ) -> Vec<(usize, MatchPlayer)> {
     let mut out = Vec::new();
-    // Only the top half of each 8-aligned word is tested, four bytes at a time
-    // with no branch, so a pass over gigabytes costs a compare per word.
-    for (word, chunk) in buf.chunks_exact(8).enumerate() {
-        let high = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
-        if high != STEAM_HIGH {
+    // The top half of an 8-aligned word, found by the fast search (21 Oct
+    // 2026: a compare per word cost 50 to 230 ms per GB; this finds the same
+    // words). Overlapping hits are kept so an aligned one is never skipped.
+    for high_at in crate::scan::all_at(steam_high(), buf) {
+        if high_at % 8 != 4 {
             continue;
         }
-        let at = word * 8;
+        let at = high_at - 4;
         let Some(start) = at.checked_sub(offsets.steam_id) else {
             continue;
         };
@@ -450,6 +456,78 @@ pub(crate) fn test_object(account_id: u32, name: &str, team: u8, slot: u8, hero:
 mod tests {
     use super::test_object as object;
     use super::*;
+
+    /// The word-by-word loop the fast search replaced (to 21 Oct 2026).
+    fn find_players_by_word(
+        buf: &[u8],
+        offsets: Offsets,
+        our_account: u32,
+        watch: &[u32],
+        rejected: &mut Vec<Rejected>,
+    ) -> Vec<(usize, MatchPlayer)> {
+        let mut out = Vec::new();
+        for (word, chunk) in buf.chunks_exact(8).enumerate() {
+            let high = u32::from_le_bytes([chunk[4], chunk[5], chunk[6], chunk[7]]);
+            if high != STEAM_HIGH {
+                continue;
+            }
+            let at = word * 8;
+            let Some(start) = at.checked_sub(offsets.steam_id) else {
+                continue;
+            };
+            if let Some(player) = player_at(buf, start, offsets, our_account) {
+                out.push((start, player));
+            } else if !watch.is_empty()
+                && let Some(reject) = rejected_at(buf, start, offsets, watch)
+            {
+                rejected.push(reject);
+            }
+        }
+        out
+    }
+
+    /// The fast search finds every player and every turned-away object the
+    /// word loop did: random memory crowded with Steam id halves at every
+    /// alignment, overlapping runs of them, and real objects among them.
+    #[test]
+    fn the_fast_search_finds_what_the_word_loop_found() {
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..20_usize {
+            let len = 64 * 1024 + (round * 8) + (round % 7);
+            let mut buf: Vec<u8> = (0..len).map(|_| (next() >> 24) as u8).collect();
+            let high = STEAM_HIGH.to_le_bytes();
+            for _ in 0..400 {
+                let at = usize::try_from(next() % (len as u64 - 8)).unwrap();
+                buf[at..at + 4].copy_from_slice(&high);
+            }
+            // 01 00 10 01 00 10 01: overlapping halves.
+            for _ in 0..40 {
+                let at = usize::try_from(next() % (len as u64 - 8)).unwrap();
+                buf[at..at + 7].copy_from_slice(&[0x01, 0x00, 0x10, 0x01, 0x00, 0x10, 0x01]);
+            }
+            for (i, account) in [11_u32, 22, 33, 44].into_iter().enumerate() {
+                let obj = object(account, "name", 2, u8::try_from(i + 1).unwrap(), 7, 83);
+                let at = 8 * (1000 + 900 * i) + (round % 3) * 8;
+                if at + obj.len() <= len {
+                    buf[at..at + obj.len()].copy_from_slice(&obj);
+                }
+            }
+            for our in [33_u32, 1] {
+                let (mut a, mut b) = (Vec::new(), Vec::new());
+                let fast = find_players_watching(&buf, Offsets::CURRENT, our, &[11, 44, 99], &mut a);
+                let slow = find_players_by_word(&buf, Offsets::CURRENT, our, &[11, 44, 99], &mut b);
+                assert_eq!(fast, slow, "round {round}, ours {our}");
+                assert_eq!(a, b, "round {round}, ours {our}: turned away");
+                assert!(our != 33 || fast.len() >= 3, "round {round}: the planted players were found");
+            }
+        }
+    }
 
     #[test]
     fn the_ultimate_and_hero_damage_read_when_they_have_their_shape() {

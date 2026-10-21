@@ -13,7 +13,7 @@ use crate::game_process::game_pid;
 use super::players::{self, MatchPlayer, Offsets};
 use super::process::{GameProcess, Region};
 use super::{
-    HistoryEntry, MatchEnd, RECORD_SIZE, find_history, find_match_ends, find_match_starts,
+    HistoryEntry, MatchEnd, RECORD_SIZE, find_history, find_match_lines,
 };
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -481,8 +481,7 @@ fn read_pieces(
                 let piece = &buf[..got];
                 let searching = Instant::now();
                 let history = find_history(piece, now);
-                let ends = find_match_ends(piece);
-                let starts = find_match_starts(piece);
+                let (ends, starts) = find_match_lines(piece);
                 // The match's players, when the local account is known.
                 let here = our_account.map_or_else(Vec::new, |account| {
                     players::find_players_watching(
@@ -493,7 +492,8 @@ fn read_pieces(
                         &mut found.rejected,
                     )
                 });
-                if found.presence.len() < super::presence_probe::AT_MOST {
+                let presence_here = super::presence_probe::has_presence(piece);
+                if presence_here && found.presence.len() < super::presence_probe::AT_MOST {
                     found
                         .presence
                         .extend(super::presence_probe::snippets(piece, our_account));
@@ -504,9 +504,9 @@ fn read_pieces(
                     }
                 }
                 if throttle && found.rules.len() < 4 {
-                    let hits = super::rules::find(piece, region.base + off);
+                    let (hits, misses) = super::rules::scan(piece, region.base + off);
                     if hits.is_empty() && found.rules_misses.len() < 4 {
-                        found.rules_misses.extend(super::rules::misses(piece).into_iter().take(4));
+                        found.rules_misses.extend(misses.into_iter().take(4));
                     }
                     found.rules.extend(hits);
                 }
@@ -543,7 +543,7 @@ fn read_pieces(
                 );
                 if !history.is_empty()
                     || !ends.is_empty()
-                    || super::presence_probe::has_presence(piece)
+                    || presence_here
                 {
                     if !found.hit_regions.contains(region) {
                         found.hit_regions.push(*region);

@@ -1,5 +1,13 @@
 # DeadChaps reader
 
+## 1.0.12
+
+- Searches the game's memory several times faster, so each full read of the game uses much less of your processor, which matters most on lower-end PCs. It finds exactly what it found before.
+
+## 1.0.11
+
+- Works with the 20 October game update: every player's hero damage, ultimate timer and rejuvenator are read correctly again.
+
 ## 1.0.10
 
 - Tells the Companion which team holds the rejuvenator, so it can clip your team taking the mid boss.

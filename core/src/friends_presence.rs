@@ -194,14 +194,15 @@ pub fn record_at(b: &[u8]) -> Option<Record> {
     })
 }
 
+crate::scan::static_finder!(steam_high, &STEAM_HIGH.to_le_bytes());
+
 /// Every record in a piece read from `base`, with its address. Records sit
 /// at 8-byte boundaries.
 pub fn find_records(piece: &[u8], base: usize) -> Vec<(usize, Record)> {
     let mut out = Vec::new();
     // The SteamID's high half is the rare part: look for it, then check the
     // record around it.
-    let high = STEAM_HIGH.to_le_bytes();
-    for at in memchr::memmem::find_iter(piece, &high) {
+    for at in crate::scan::all_at(steam_high(), piece) {
         let Some(start) = at.checked_sub(4) else {
             continue;
         };

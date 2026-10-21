@@ -181,32 +181,41 @@ fn f32_at(buf: &[u8], off: usize) -> Option<f32> {
     u32_at(buf, off).map(f32::from_bits)
 }
 
+fn bounds() -> &'static memchr::memmem::Finder<'static> {
+    static F: std::sync::OnceLock<memchr::memmem::Finder<'static>> = std::sync::OnceLock::new();
+    F.get_or_init(|| crate::scan::finder(&bounds_bytes()))
+}
+
 /// Where rules objects start in `piece`, which begins at `base` in the game.
 /// Only a spot whose other fields read as rules is kept.
 pub fn find(piece: &[u8], base: usize) -> Vec<usize> {
-    let needle = bounds_bytes();
-    memchr::memmem::find_iter(piece, &needle)
-        .filter_map(|at| at.checked_sub(BOUNDS_AT))
-        .filter(|start| {
-            piece
-                .get(*start..*start + READ_BYTES)
-                .is_some_and(|obj| parse(obj).is_some())
-        })
-        .map(|start| base + start)
-        .collect()
+    scan(piece, base).0
 }
 
 /// Why the object at each place the minimap bounds sit in `piece` was not
 /// taken as the rules object, for the log when a pass finds none: the first
 /// field that does not read as a real one, with its value.
 pub fn misses(piece: &[u8]) -> Vec<String> {
-    let needle = bounds_bytes();
-    memchr::memmem::find_iter(piece, &needle)
-        .map(|at| match at.checked_sub(BOUNDS_AT).and_then(|start| piece.get(start..start + READ_BYTES)) {
-            None => "cut off by the end of the read".to_owned(),
-            Some(obj) => why_not(obj).unwrap_or_else(|| "taken".to_owned()),
-        })
-        .collect()
+    scan(piece, 0).1
+}
+
+/// [`find`] and [`misses`] from one search of `piece` (a full pass searched
+/// every piece twice for the bounds while it had not found the object).
+pub fn scan(piece: &[u8], base: usize) -> (Vec<usize>, Vec<String>) {
+    let mut hits = Vec::new();
+    let mut missed = Vec::new();
+    for at in bounds().find_iter(piece) {
+        match at.checked_sub(BOUNDS_AT).and_then(|start| Some((start, piece.get(start..start + READ_BYTES)?))) {
+            None => missed.push("cut off by the end of the read".to_owned()),
+            Some((start, obj)) => {
+                if parse(obj).is_some() {
+                    hits.push(base + start);
+                }
+                missed.push(why_not(obj).unwrap_or_else(|| "taken".to_owned()));
+            }
+        }
+    }
+    (hits, missed)
 }
 
 /// The first field of a candidate that rules it out, or None when it is one.
