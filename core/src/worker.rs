@@ -6,8 +6,8 @@
 
 use super::friends_presence;
 use super::view::{
-    EndedMatch, GameEnd, KEEP_ENDED, MemoryView, Objectives, PARTY_MAX, load_ended, match_leftover, party_shaped,
-    reads_as,
+    EndedMatch, GameEnd, KEEP_ENDED, MemoryView, Objectives, PARTY_MAX, SPECTATORS, load_ended, match_leftover,
+    party_shaped, reads_as,
 };
 use crate::game_process::game_pid;
 use super::players::{self, MatchPlayer, Offsets};
@@ -926,6 +926,37 @@ const REPLY_FOR: Duration = Duration::from_secs(300);
 /// its console buffer mid-match, not news; treating it as news runs a full
 /// pass about every 50 s through the first minutes of a match, 13 to 22 s
 /// of CPU each. A match's end asks for its own pass.
+/// The newest match known to be over, by its end line or the game ending it.
+fn match_over_id(view: &MemoryView) -> Option<u64> {
+    view.last_match_end
+        .map(|e| e.match_id)
+        .max(view.game_end.map(|g| g.match_id))
+}
+
+/// The lobby whose object the full pass looks for, for the match's modes:
+/// the match the console names now, or failing that the last it named while
+/// that match is not over, and only while the modes are not known.
+fn lobby_to_watch(
+    named: Option<MatchEnd>,
+    last: Option<MatchEnd>,
+    modes_known: bool,
+    over: Option<u64>,
+) -> Option<(u64, u64)> {
+    if modes_known {
+        return None;
+    }
+    named
+        .or(last.filter(|s| over < Some(s.match_id)))
+        .map(|s| (s.lobby_id, s.match_id))
+}
+
+/// Whether modes read for `modes_for` still describe the match the game is
+/// in (`current`): kept while the console's name comes and goes, dropped
+/// once another match is named or this one is over.
+fn modes_belong(modes_for: Option<u64>, current: Option<u64>) -> bool {
+    modes_for.is_some() && modes_for == current
+}
+
 fn console_names_new_match(now: Option<u64>, seen: Option<u64>) -> bool {
     now.is_some_and(|id| seen.is_none_or(|seen| id > seen))
 }
@@ -974,17 +1005,27 @@ fn regions_to_read(process: &GameProcess, in_ram: bool, logged: &mut Option<usiz
 }
 
 /// Whether our player is playing a match the console has not named yet:
-/// seated on team 3 past any seat a party uses (6v6 seats team 3 in 7 to
-/// 12, Street Brawl in 5 to 8), and moving since the last read (`last`). A
-/// finished match leaves our object frozen in its seat for minutes, which
-/// is not this. Without it a Street Brawl read with five of its players,
+/// in a seat only a match uses (`in_play_seat`), and moving since the last
+/// read (`last`). A finished match leaves our object frozen in its seat for
+/// minutes, which is not this. Without it a Street Brawl read with five of its players,
 /// before the console's line or the rules object turned up, counted as a
 /// party in the hideout: the timers were not looked for, the reads were not
 /// a match's, and Discord said the hideout.
 fn playing_unnamed(us: Option<&MatchPlayer>, last: Option<&MatchPlayer>) -> bool {
     us.zip(last).is_some_and(|(us, last)| {
-        us.team == 3 && usize::from(us.slot) > PARTY_MAX && us.account_id == last.account_id && !reads_as(us, last)
+        in_play_seat(us) && us.account_id == last.account_id && !reads_as(us, last)
     })
+}
+
+/// A seat only a match uses: team 3 past any seat a party uses (6v6 seats
+/// team 3 in 7 to 12, Street Brawl in 5 to 8), or any team but the
+/// spectators' with a lane, which the game gives only in a match. Team 2
+/// seats 1 to 6 are also the hideout's, so there the lane is what tells: a
+/// private lobby of our own, with nobody queueing and no bot to name it,
+/// sat on team 2 slot 1 with lane 6 and was read as the hideout all match,
+/// so its console line was never looked for (28 Oct 2026).
+fn in_play_seat(us: &MatchPlayer) -> bool {
+    (us.team == 3 && usize::from(us.slot) > PARTY_MAX) || (us.team != SPECTATORS && us.lane.is_some())
 }
 
 /// Whether the match timers show: our player seated, the rules object
@@ -1517,6 +1558,15 @@ fn run(
     // afresh every cycle and goes when the console line leaves memory, often
     // mid match; the match that then ends is still this one.
     let mut last_started: Option<u64> = None;
+    // The same, with its lobby id: the full pass looks for that lobby's
+    // object (`watch_lobby`) whether or not the view still names the match.
+    let mut last_start: Option<MatchEnd> = None;
+    // The match the published modes were read for. A quick read drops the
+    // console's name from the view (the console piece is not kept), and that
+    // used to wipe the modes with it, so the Companion never had the match's
+    // id and its private-lobby mode at once and never reported a lobby to the
+    // site for pairing (28 Oct 2026: not one pairing since it shipped).
+    let mut modes_match: Option<u64> = None;
     // The game's friend records, what each read said, and when they were
     // last read; the counts as last logged.
     let mut friends = friends_presence::Tracker::default();
@@ -1686,9 +1736,7 @@ fn run(
             // modes, until they are known.
             let watch_lobby = {
                 let view = lock(&shared.view);
-                view.match_started
-                    .filter(|_| view.match_modes.is_none())
-                    .map(|s| (s.lobby_id, s.match_id))
+                lobby_to_watch(view.match_started, last_start, view.match_modes.is_some(), match_over_id(&view))
             };
             read_pieces(
                 process,
@@ -1713,6 +1761,7 @@ fn run(
                 }
                 if let (Some(mm), Some(gm)) = (hit.match_mode, hit.game_mode) {
                     publish(&|v| v.match_modes = Some((mm, gm)));
+                    modes_match = watch_lobby.map(|(_, match_id)| match_id);
                 }
             }
             // Valve's replies, tied to their matches through the game's
@@ -2300,7 +2349,7 @@ fn run(
             )
         };
         let us_now = match_players.iter().find(|p| p.is_us);
-        let us_elsewhere = us_now.is_some_and(|us| us.team != 3 || usize::from(us.slot) <= PARTY_MAX);
+        let us_elsewhere = us_now.is_some_and(|us| !in_play_seat(us));
         if match_players.is_empty() || us_elsewhere || rules_now.is_some_and(|r| r.state > STATE_IN_PROGRESS) {
             playing_seen = false;
         } else if !playing_seen && playing_unnamed(us_now, last_us.as_ref()) {
@@ -2541,9 +2590,6 @@ fn run(
             // game is in; after the end line it is over.
             let started =
                 start.filter(|s| v.last_match_end.is_none_or(|e| s.match_id > e.match_id));
-            if started.map(|s| s.match_id) != v.match_started.map(|s| s.match_id) {
-                v.match_modes = None;
-            }
             v.match_started = started;
             if v.steam_id != steam_id {
                 // A different Steam account: what was read belongs to the last one.
@@ -2562,6 +2608,17 @@ fn run(
                 v.ended.truncate(KEEP_ENDED);
                 crate::store::save(ended_path, &v.ended);
             }
+            // The modes belong to the match the game is in: the one named
+            // now, or the last named while it is not over and we are not
+            // back in the hideout (a match left with no end read must not
+            // lend its modes to the next).
+            let current = started
+                .map(|s| s.match_id)
+                .or(last_started)
+                .filter(|id| match_over_id(v) < Some(*id) && !v.in_hideout());
+            if !modes_belong(modes_match, current) {
+                v.match_modes = None;
+            }
         });
         let started_now = lock(&shared.view).match_started.map(|s| s.match_id);
         if console_names_new_match(started_now, last_started) {
@@ -2572,6 +2629,10 @@ fn run(
         }
         if let Some(id) = started_now {
             last_started = Some(id);
+            last_start = lock(&shared.view).match_started;
+        }
+        if lock(&shared.view).match_modes.is_none() {
+            modes_match = None;
         }
         shared.wait(PLAYERS_EVERY);
     }
@@ -3021,15 +3082,58 @@ mod tests {
         assert!(seated_in_match(&read, false, true), "with it: seated, so the timers' passes run");
         // A finished match's object, frozen: not moving, not this.
         assert!(!playing_unnamed(Some(&before), Some(&before)));
-        // Team 2, or a party seat: never this.
+        // Team 2, or a party seat, with no lane: the hideout's seats, never this.
         let mut team2 = now.clone();
         team2.team = 2;
         assert!(!playing_unnamed(Some(&team2), Some(&before)));
         let mut low = now.clone();
         low.slot = 5;
         assert!(!playing_unnamed(Some(&low), Some(&before)));
+        // A spectator is watching, lane or not.
+        let mut watching = now.clone();
+        watching.team = SPECTATORS;
+        watching.lane = Some(6);
+        assert!(!playing_unnamed(Some(&watching), Some(&before)));
+        // Our own private lobby with bots, as logged 28 Oct 2026: alone on
+        // team 2 slot 1, lane 6, levelling, no queue and no console line read.
+        let mut lobby_before = seated(106_448_300, 2, 1, true);
+        lobby_before.lane = Some(6);
+        lobby_before.level = 2;
+        let mut lobby_now = lobby_before.clone();
+        lobby_now.level = 3;
+        assert!(playing_unnamed(Some(&lobby_now), Some(&lobby_before)));
+        let alone = vec![lobby_now.clone()];
+        assert!(!seated_in_match(&alone, false, false), "without it: the hideout");
+        assert!(seated_in_match(&alone, false, true), "with it: seated, so the passes that find the console line run");
+        // The hideout seats us there too, with no lane.
+        let mut hideout = lobby_now.clone();
+        hideout.lane = None;
+        assert!(!playing_unnamed(Some(&hideout), Some(&lobby_before)));
         // Nothing to compare with yet.
         assert!(!playing_unnamed(Some(&now), None));
+    }
+
+    #[test]
+    fn a_private_lobbys_modes_are_looked_for_and_kept_while_the_name_comes_and_goes() {
+        // As read live 28 Oct 2026: the console named 126468204 in lobby
+        // 174199178237604155 on one full pass, and the next quick read could
+        // not see the line. The lobby object was there all along.
+        let start = MatchEnd { lobby_id: 174_199_178_237_604_155, match_id: 126_468_204 };
+        // The view no longer names it: the pass still looks for its lobby.
+        assert_eq!(lobby_to_watch(None, Some(start), false, None), Some((start.lobby_id, start.match_id)));
+        assert_eq!(lobby_to_watch(Some(start), None, false, None), Some((start.lobby_id, start.match_id)));
+        // Not once the modes are known, nor once that match is over.
+        assert_eq!(lobby_to_watch(None, Some(start), true, None), None);
+        assert_eq!(lobby_to_watch(None, Some(start), false, Some(126_468_204)), None);
+        assert_eq!(lobby_to_watch(None, Some(start), false, Some(126_500_000)), None);
+        // An older match's end does not stop it.
+        assert_eq!(lobby_to_watch(None, Some(start), false, Some(126_451_403)), Some((start.lobby_id, start.match_id)));
+        // The modes stay while the console's name drops out (the worker
+        // falls back to the last named match), and go for another match.
+        assert!(modes_belong(Some(126_468_204), Some(126_468_204)));
+        assert!(!modes_belong(Some(126_468_204), Some(126_470_000)));
+        assert!(!modes_belong(Some(126_468_204), None));
+        assert!(!modes_belong(None, Some(126_468_204)));
     }
 
     #[test]

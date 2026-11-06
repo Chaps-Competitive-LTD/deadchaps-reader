@@ -1,5 +1,10 @@
 # DeadChaps reader
 
+## 1.0.14
+
+- Pugs played in a lobby you made yourselves now finish on their own. The reader finds the match and tells the Companion it is a DeadChaps private lobby, so the bot gets the match id without anyone typing it in. Before, the Companion never managed to report one.
+- A private lobby on the Hidden King's side is now read as a match from the start, not as the hideout.
+
 ## 1.0.13
 
 - Reads the whole game less often while nothing is happening, such as a game left open in the menus, and looks for the match timers a little later in the draft, when they are there to find. Fewer full reads in all, so less of your processor.
