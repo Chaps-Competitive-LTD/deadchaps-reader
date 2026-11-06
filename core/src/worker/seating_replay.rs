@@ -397,3 +397,108 @@ fn a_window_that_finds_nobody_costs_about_what_it_did() {
     assert!(extra[0] < 0.0, "after a pop: less than the passes");
     assert!(extra[1] < 25.0, "at a menu: the quick sweeps' cost and no more");
 }
+
+/// Every sign in a week of our test PC's logs that a sweep
+/// followed: how long the sweep before the sign took, and the first one
+/// after it, in ms. The one after took up to 2.7 times the one before.
+const SIGN_SWEEPS: &[(u32, u32)] = &[
+    (2355, 4787), (4787, 3898), (3898, 4334), (4334, 4210), (4174, 2584), (2584, 4718), (4718, 4252),
+    (4252, 4032), (4032, 2194), (2194, 3055), (1764, 1173), (1319, 2335), (2335, 3438), (3438, 2230),
+    (2230, 3405), (3405, 3028), (2672, 3245), (3245, 2037), (2037, 4333), (4333, 2206), (2206, 1993),
+    (1739, 2213), (2213, 4756), (4756, 2579), (2579, 3112), (3112, 3517), (3517, 2022), (2022, 3772),
+    (3772, 1783), (1783, 805), (1513, 2210), (2210, 4036), (5617, 4626), (4626, 1817), (1817, 2780),
+    (2780, 4018), (4018, 1276), (1649, 2455), (2455, 3456), (3456, 2260), (2260, 1720), (1720, 1913),
+    (1913, 3662), (3662, 1823), (1823, 2340), (2340, 526), (1472, 500), (1144, 957), (2231, 1351),
+    (1636, 242), (1432, 2740), (2740, 4699), (4699, 2209), (2209, 3866), (3846, 4233), (4233, 4295),
+    (4295, 2235), (2235, 4040), (4040, 1784), (1784, 4755),
+];
+
+/// The turns from a sign (noticed at the end of a turn, at 0 s) until a
+/// sweep that starts once the lobby is readable (`all`, seconds from the
+/// sign) ends, through the loop's own rules: `at_once` sweeps at the sign,
+/// otherwise the turn comes a loop later as before. Each sweep takes
+/// `took`, the one before the sign `before`. Returns when the lobby is read
+/// and the sweeps run.
+fn seat_after_sign(at_once_rule: bool, before: f64, took: f64, all: f64) -> (f64, u32) {
+    let d = |x: f64| Duration::from_secs_f64(x.max(0.0));
+    let base = Instant::now();
+    let at = |x: f64| base + d(x);
+    let by = AT_ONCE_BY.as_secs_f64();
+    let mut follow_up_at = at_once_rule.then(|| at(tick()));
+    let mut at_once = at_once_rule && sweep_at_once(true, 0, false, Some(d(before)));
+    let mut last_took = Some(d(before));
+    let mut last_end: Option<f64> = None;
+    let mut sweeps = 0;
+    let mut t = if at_once_rule { next_turn_in(at_once, follow_up_at, base).as_secs_f64() } else { tick() };
+    while t < 120.0 {
+        let turn = t;
+        let follow = follow_up_due(follow_up_at, at(turn), true);
+        let since_read = last_end.map(|e| d(turn - e));
+        if follow || sweep_due(Some(d(turn)), 0, false, since_read, last_took) {
+            sweeps += 1;
+            let cut = at_once && turn + took > by;
+            let end = if cut { by.max(turn) } else { turn + took };
+            if !cut && turn >= all {
+                return (end, sweeps);
+            }
+            last_took = Some(d(end - turn));
+            last_end = Some(end);
+            t = end;
+        }
+        if follow_up_at.is_some_and(|f| at(turn) >= f) {
+            follow_up_at = None;
+        }
+        at_once = false;
+        t += if at_once_rule { next_turn_in(false, follow_up_at, at(t)).as_secs_f64() } else { tick() };
+    }
+    (f64::INFINITY, sweeps)
+}
+
+/// The sweep at the sign never reads a lobby later than the loop did before
+/// it, wherever from five seconds before the sign to ten after it the lobby
+/// became readable, with every sign's real sweep times; and where the lobby
+/// was readable a loop before its first sweep (the log cannot say when),
+/// that loop is saved. It costs at most one sweep more per sign.
+#[test]
+fn sweeping_at_the_sign_is_never_later() {
+    let mut saved = Vec::new();
+    let mut extra = 0_i64;
+    let mut cases = 0_i64;
+    for &(before, after) in SIGN_SWEEPS {
+        let (before, after) = (f64::from(before) / 1000.0, f64::from(after) / 1000.0);
+        for k in 0..=60 {
+            let all = -5.0 + 0.25 * f64::from(k);
+            let (old, old_sweeps) = seat_after_sign(false, before, after, all);
+            let (new, new_sweeps) = seat_after_sign(true, before, after, all);
+            assert!(
+                new <= old + 1e-9,
+                "sweeps of {before} s then {after} s, lobby readable at {all} s: read at {new:.2} s, before at {old:.2} s"
+            );
+            assert!(new_sweeps <= old_sweeps + 1, "one sweep more at most: {new_sweeps} against {old_sweeps}");
+            extra += i64::from(new_sweeps) - i64::from(old_sweeps);
+            cases += 1;
+            if all <= 0.0 {
+                saved.push(old - new);
+            }
+        }
+    }
+    let mut s = saved.clone();
+    println!(
+        "lobby readable by the sign: {:.1} s sooner at the median, least {:.1} s; {:.2} sweeps more a sign on average",
+        median(&mut s),
+        saved.iter().copied().fold(f64::INFINITY, f64::min),
+        extra as f64 / cases as f64
+    );
+    // Readable at the sign, on a PC whose sweep is done by the deadline: a
+    // whole loop sooner.
+    let (old, _) = seat_after_sign(false, 2.6, 3.5, 0.0);
+    let (new, _) = seat_after_sign(true, 2.6, 3.5, 0.0);
+    assert!((old - new - tick()).abs() < 1e-9, "a loop sooner: {old} against {new}");
+    // A sweep too slow for the deadline is cut, and the old sweep a loop
+    // after the sign reads the lobby as before.
+    let (old, _) = seat_after_sign(false, 4.0, 6.0, 0.0);
+    let (new, sweeps) = seat_after_sign(true, 4.0, 6.0, 0.0);
+    assert!((old - new).abs() < 1e-9 && sweeps == 2, "cut, then as before: {old} against {new}, {sweeps} sweeps");
+    // A PC whose last sweep took past the deadline keeps the old timing.
+    assert_eq!(seat_after_sign(true, 5.0, 4.0, 0.0), seat_after_sign(false, 5.0, 4.0, 0.0));
+}

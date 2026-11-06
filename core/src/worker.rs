@@ -812,6 +812,45 @@ const SWEEP_SLOW_RATIO: u32 = 4;
 /// takes about 6 s.
 const SLOW_SWEEP: Duration = Duration::from_secs(8);
 
+/// A sweep at the sign itself stops this long after the sign, so it is over
+/// before the sweep a loop after the sign (`follow_up_due`), with half a
+/// second spare for the turn's other reads.
+const AT_ONCE_BY: Duration = Duration::from_millis(4500);
+
+/// Whether the turn after a sign comes at once and sweeps, instead of a loop
+/// later, so the Lobby's players show up sooner. Across 16 lobbies in our
+/// test PC's logs the first sweep began exactly
+/// one loop (5.0 s) after the sign and read the lobby every time, a median
+/// 9.0 s after it, so up to that loop was spent waiting. Not when players
+/// are read, nor after a turn that read the whole game (`read_now`: a sweep
+/// or a full pass), nor when the last sweep took
+/// longer than `AT_ONCE_BY`: a sweep right after a sign took up to 2.7 times
+/// the one before it in those logs (the game grows as the match loads), and
+/// one that cannot finish by the deadline is cut there, so a PC that sweeps
+/// that slowly keeps the old timing until a sweep is quick again.
+fn sweep_at_once(sign_now: bool, players_now: usize, read_now: bool, last_took: Option<Duration>) -> bool {
+    sign_now && players_now == 0 && !read_now && last_took.is_none_or(|t| t <= AT_ONCE_BY)
+}
+
+/// Whether the sweep a loop after a sign runs, even though a sweep at the
+/// sign ended less than `SWEEP_GAP` before it: it is the sweep the reader
+/// ran a loop after every sign before it swept at once, so no lobby is read
+/// later than it was. `due_at` is a loop after the last sign.
+fn follow_up_due(due_at: Option<Instant>, now: Instant, sweeping: bool) -> bool {
+    sweeping && due_at.is_some_and(|at| now >= at)
+}
+
+/// How long the loop rests before its next turn: none when that turn sweeps
+/// at the sign, else `PLAYERS_EVERY`, or less to start the turn at
+/// `follow_up_at`, a loop after the sign, as it started before a sweep at
+/// the sign took up part of the loop.
+fn next_turn_in(at_once: bool, follow_up_at: Option<Instant>, now: Instant) -> Duration {
+    if at_once {
+        return Duration::ZERO;
+    }
+    follow_up_at.map_or(PLAYERS_EVERY, |at| at.saturating_duration_since(now).min(PLAYERS_EVERY))
+}
+
 /// Whether a full pass asked for only to find players waits: the sweeps are
 /// looking (`sweeping`), and it is still the first `SWEEP_FAST_FOR` after
 /// the sign. Such a pass takes 15 to 20 s and the sweeps stop for it, so a
@@ -835,19 +874,20 @@ fn queue_stopped(was: bool, now: bool) -> bool {
 /// rules, Valve's replies or the friend records. `read` takes an address
 /// and a buffer and returns the bytes read; outside tests it reads the
 /// game. Pieces overlap as a full pass's do, so an object across two is
-/// read whole. `pause` runs after every `THROTTLE_EVERY` bytes. Returns the
-/// bytes read.
+/// read whole. `pause` runs after every `THROTTLE_EVERY` bytes and returns
+/// whether to carry on: a sweep with a deadline stops there, having read
+/// only part of the game. Returns the bytes read.
 fn sweep_players(
     read: impl Fn(usize, &mut [u8]) -> usize,
     regions: &[Region],
     our_account: u32,
-    mut pause: impl FnMut(),
+    mut pause: impl FnMut() -> bool,
     found: &mut Vec<(usize, MatchPlayer)>,
 ) -> usize {
     let mut buf = vec![0_u8; CHUNK];
     let mut bytes = 0_usize;
     let mut since_pause = 0_usize;
-    for region in regions {
+    'regions: for region in regions {
         let mut off = 0_usize;
         while off < region.size {
             let want = CHUNK.min(region.size - off);
@@ -861,7 +901,9 @@ fn sweep_players(
             since_pause += got;
             if since_pause >= THROTTLE_EVERY {
                 since_pause = 0;
-                pause();
+                if !pause() {
+                    break 'regions;
+                }
             }
             if want <= OVERLAP || off + want >= region.size {
                 break;
@@ -1502,6 +1544,10 @@ fn run(
     // How long the last sweep took, which spaces the next on a slow PC
     // (`sweep_due`).
     let mut last_whole_took: Option<Duration> = None;
+    // Whether this turn sweeps at the sign (`sweep_at_once`), and when the
+    // sweep a loop after the last sign falls due (`follow_up_due`).
+    let mut at_once = false;
+    let mut follow_up_at: Option<Instant> = None;
     let mut seated_short = false;
     // The regions the players last found sat in, so the log can say whether
     // the next lobby's objects land in the same ones.
@@ -1694,6 +1740,8 @@ fn run(
 
         // Which account is ours, so the match's players can be told apart.
         let our_account = steam_account().and_then(|id| id.parse::<u32>().ok());
+        // A sign given during this turn sets `seating_from` anew.
+        let sign_before = seating_from;
         let mut found = Found::default();
         let mut pass_ran = false;
         // A match read short (players gone from memory) keeps the shorter
@@ -2076,31 +2124,45 @@ fn run(
         // CPU at the same share of a core while it runs (see `SWEEP_PAUSE`),
         // so it can run far more often (`sweep_due`).
         let mut sweep_ran = false;
+        let turn_at = Instant::now();
+        let follow_up = follow_up_due(follow_up_at, turn_at, sweeping);
         if !pass_ran
             && !players_pass_asked
             && let Some(account) = our_account
-            && sweep_due(
-                seating_from.map(|at| at.elapsed()),
-                players_before,
-                seated_short,
-                last_pass.max(last_sweep).map(|at| at.elapsed()),
-                last_whole_took,
-            )
+            && (follow_up
+                || sweep_due(
+                    seating_from.map(|at| at.elapsed()),
+                    players_before,
+                    seated_short,
+                    last_pass.max(last_sweep).map(|at| at.elapsed()),
+                    last_whole_took,
+                ))
         {
             let _quiet = Background::begin();
             let started = Instant::now();
             let cpu_before = thread_cpu();
             let (regions, _) = regions_to_read(process, true, &mut ram_logged);
             let mut swept = Vec::new();
+            let deadline = if at_once { seating_from.map(|at| at + AT_ONCE_BY) } else { None };
+            let cut = std::cell::Cell::new(false);
             let bytes = sweep_players(
                 |a, b| process.read(a, b),
                 &regions,
                 account,
-                || thread::sleep(SWEEP_PAUSE),
+                || {
+                    thread::sleep(SWEEP_PAUSE);
+                    cut.set(deadline.is_some_and(|by| Instant::now() >= by));
+                    !cut.get()
+                },
                 &mut swept,
             );
+            let how = match (at_once, cut.get()) {
+                (true, true) => ", swept at the sign, stopped at its deadline",
+                (true, false) => ", swept at the sign",
+                _ => "",
+            };
             info!(
-                "Game memory: seating sweep read {} MB in {} regions in {} ms, {} ms CPU, {} player objects, {} s after the sign",
+                "Game memory: seating sweep read {} MB in {} regions in {} ms, {} ms CPU, {} player objects, {} s after the sign{how}",
                 bytes >> 20,
                 regions.len(),
                 started.elapsed().as_millis(),
@@ -2108,17 +2170,24 @@ fn run(
                 swept.len(),
                 seating_from.map_or(0, |at| at.elapsed().as_secs())
             );
-            let spots: Vec<usize> = swept.iter().map(|(at, _)| *at).collect();
-            note_player_regions("the sweep", &regions, &spots, &mut player_regions);
-            // The sweep read every object there is, those in the kept
-            // pieces among them.
-            found.players = swept;
+            // A sweep stopped at its deadline read only part of the game, so
+            // what it found is not every object there is.
+            if !cut.get() {
+                let spots: Vec<usize> = swept.iter().map(|(at, _)| *at).collect();
+                note_player_regions("the sweep", &regions, &spots, &mut player_regions);
+                // The sweep read every object there is, those in the kept
+                // pieces among them.
+                found.players = swept;
+            }
             last_whole_took = Some(started.elapsed());
             last_sweep = Some(Instant::now());
             sweep_ran = true;
             if players_before > 0 {
                 short_spent += 1;
             }
+        }
+        if follow_up_at.is_some_and(|at| turn_at >= at) {
+            follow_up_at = None;
         }
 
         // Friends' rich presence: the records a pass found, read again every
@@ -2634,7 +2703,16 @@ fn run(
         if lock(&shared.view).match_modes.is_none() {
             modes_match = None;
         }
-        shared.wait(PLAYERS_EVERY);
+        // A sign this turn: the next turn sweeps at once where it can, and
+        // the sweep a loop after the sign stays due either way.
+        let sign_now = seating_from != sign_before;
+        if sign_now {
+            follow_up_at = seating_from.map(|at| at + PLAYERS_EVERY);
+        }
+        let players_now = lock(&shared.view).match_players.len();
+        at_once = our_account.is_some()
+            && sweep_at_once(sign_now, players_now, sweep_ran || pass_ran, last_whole_took);
+        shared.wait(next_turn_in(at_once, follow_up_at, Instant::now()));
     }
 }
 
@@ -3014,7 +3092,7 @@ mod tests {
         };
         let mut pauses = 0;
         let mut found = Vec::new();
-        let bytes = sweep_players(read, &regions, US, || pauses += 1, &mut found);
+        let bytes = sweep_players(read, &regions, US, || { pauses += 1; true }, &mut found);
         let at: Vec<usize> = found.iter().map(|(at, _)| *at).collect();
         let mut want: Vec<usize> = spots_a.iter().map(|s| base_a + s).collect();
         want.push(base_b + 0x100);
@@ -3027,6 +3105,41 @@ mod tests {
         assert_eq!(regions_holding(&regions, &spots), regions.to_vec());
         assert_eq!(regions_holding(&regions, &[base_b + small]), Vec::new(), "past the end of the last");
         assert_eq!(regions_holding(&regions, &[base_a - 1]), Vec::new(), "before the first");
+
+        // A rest that says stop ends the sweep there: the first 64 MB read,
+        // the objects past it and the second region not.
+        let mut cut = Vec::new();
+        let bytes = sweep_players(read, &regions, US, || false, &mut cut);
+        assert!((THROTTLE_EVERY..THROTTLE_EVERY + CHUNK).contains(&bytes), "stopped at the first rest: {bytes}");
+        let at: Vec<usize> = cut.iter().map(|(at, _)| *at).collect();
+        assert_eq!(at, vec![base_a + spots_a[0], base_a + spots_a[1]]);
+    }
+
+    /// The sweep at a sign, so the Lobby's players show up sooner:
+    /// when the next turn comes at once, and when it keeps the old timing.
+    #[test]
+    fn a_sign_sweeps_at_once_unless_it_cannot_be_quick() {
+        let ms = Duration::from_millis;
+        assert!(sweep_at_once(true, 0, false, None), "no sweep yet this run");
+        assert!(sweep_at_once(true, 0, false, Some(ms(2600))), "the median sweep");
+        assert!(sweep_at_once(true, 0, false, Some(AT_ONCE_BY)));
+        assert!(!sweep_at_once(true, 0, false, Some(ms(4501))), "too slow for the deadline");
+        assert!(!sweep_at_once(false, 0, false, Some(ms(2600))), "no sign");
+        assert!(!sweep_at_once(true, 2, false, Some(ms(2600))), "players read: nobody to look for");
+        assert!(!sweep_at_once(true, 0, true, Some(ms(2600))), "the game was just read");
+
+        let now = Instant::now();
+        assert_eq!(next_turn_in(true, Some(now + PLAYERS_EVERY), now), Duration::ZERO);
+        assert_eq!(next_turn_in(false, None, now), PLAYERS_EVERY, "no sign: a loop as ever");
+        assert_eq!(next_turn_in(false, Some(now + ms(1200)), now), ms(1200), "the turn starts a loop after the sign");
+        assert_eq!(next_turn_in(false, Some(now + ms(9000)), now), PLAYERS_EVERY, "never longer than a loop");
+        assert_eq!(next_turn_in(false, Some(now - ms(10)), now), Duration::ZERO, "due already");
+
+        assert!(follow_up_due(Some(now), now, true));
+        assert!(!follow_up_due(Some(now + ms(1)), now, true), "not yet");
+        assert!(!follow_up_due(Some(now), now, false), "nobody to look for");
+        assert!(!follow_up_due(None, now, true));
+        assert!(AT_ONCE_BY < PLAYERS_EVERY, "the sweep at the sign is over before the one a loop after");
     }
 
     fn seated(account_id: u32, team: u8, slot: u8, is_us: bool) -> MatchPlayer {

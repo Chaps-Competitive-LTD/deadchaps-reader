@@ -1,5 +1,9 @@
 # DeadChaps reader
 
+## 1.0.15
+
+- The Lobby can show a new match's players a few seconds sooner. When a match starts loading, the reader now looks for its players straight away instead of a few seconds later, and still looks again at the old moment if they are not there yet, so a lobby is never shown later than before.
+
 ## 1.0.14
 
 - Pugs played in a lobby you made yourselves now finish on their own. The reader finds the match and tells the Companion it is a DeadChaps private lobby, so the bot gets the match id without anyone typing it in. Before, the Companion never managed to report one.
