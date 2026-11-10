@@ -67,6 +67,10 @@ const AFTER_END: u32 = 20 * 60;
 /// Every field of the reply set.
 const ALL_FIELDS: u32 = 63;
 const RESULT_OK: u32 = 1;
+/// High 32 bits of a pointer into a loaded module: 0x7ff… on Windows,
+/// 0x6fff… under Proton/Wine.
+const MODULE_HIGH_WIN: std::ops::RangeInclusive<u32> = 0x7ff0..=0x7fff;
+const MODULE_HIGH_PROTON: std::ops::RangeInclusive<u32> = 0x6ff0..=0x6fff;
 /// Unix times the game could plausibly hold (2020 to 2038).
 const TIMES: std::ops::RangeInclusive<u32> = 1_577_836_800..=2_145_916_800;
 
@@ -104,7 +108,7 @@ pub fn replies(buf: &[u8], base: usize) -> Vec<Reply> {
         if !(base + i).is_multiple_of(16) || i + 48 > buf.len() {
             continue;
         }
-        if (0x7ff0..=0x7fff).contains(&word(i + 4))
+        if (MODULE_HIGH_WIN.contains(&word(i + 4)) || MODULE_HIGH_PROTON.contains(&word(i + 4)))
             && word(i + 8) == 0
             && word(i + 12) == 0
             && word(i + 16) == ALL_FIELDS
@@ -337,7 +341,7 @@ mod tests {
         };
         let mut i = (16 - base % 16) % 16;
         while i + 48 <= buf.len() {
-            if (0x7ff0..=0x7fff).contains(&word(i + 4))
+            if (MODULE_HIGH_WIN.contains(&word(i + 4)) || MODULE_HIGH_PROTON.contains(&word(i + 4)))
                 && word(i + 8) == 0
                 && word(i + 12) == 0
                 && word(i + 16) == ALL_FIELDS
@@ -595,6 +599,20 @@ mod tests {
             url(105_808_982, reply.cluster, reply.metadata_salt),
             "http://replay271.valve.net/1422450/105808982_2047037298.meta.bz2"
         );
+    }
+
+    #[test]
+    fn the_reply_is_read_under_proton_where_modules_sit_at_0x6fff() {
+        // Under Proton/Wine the game's modules load at 0x6fff_xxxx_xxxx, so
+        // the reply's module pointer has 0x6fff for its high word, not 0x7ff_.
+        let mut buf = reply_105808982();
+        buf[36..40].copy_from_slice(&0x6fff_u32.to_le_bytes());
+        let found = replies(&buf, 0x10);
+        assert_eq!(found.len(), 1, "the Proton reply is there to be read");
+        assert_eq!(found[0].metadata_salt, 2_047_037_298);
+        // Not every high word passes: one that names no module stays out.
+        buf[36..40].copy_from_slice(&0x5000_u32.to_le_bytes());
+        assert!(replies(&buf, 0x10).is_empty());
     }
 
     #[test]
