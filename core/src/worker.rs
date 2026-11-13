@@ -450,6 +450,9 @@ struct Found {
     replies: Vec<super::salts_probe::Reply>,
     /// The lobby object for the match the console named.
     lobby_hits: Vec<super::salts_probe::LobbyHit>,
+    /// The game's summaries of matches that started when an unkeyed reply
+    /// says, a second way to key it (`Watching::reply_starts`).
+    summaries: Vec<super::salts_probe::Summary>,
     /// Each history list found, kept apart: the game holds other players'
     /// histories too, and only a comparison with the account's known history
     /// can tell which list is this account's.
@@ -465,11 +468,14 @@ struct Found {
 
 /// What a full pass looks for besides the history, the console and the
 /// players: the accounts whose objects are worth a log line when turned
-/// away, and the lobby (lobby id, match id) whose modes are still unknown.
+/// away, the lobby (lobby id, match id) whose modes are still unknown, and
+/// the start times of Valve's replies the history did not key last pass,
+/// whose match summaries can key them instead.
 #[derive(Default)]
 struct Watching<'a> {
     accounts: &'a [u32],
     lobby: Option<(u64, u64)>,
+    reply_starts: &'a [u32],
 }
 
 /// Reads `regions` piece by piece and searches each piece for everything
@@ -542,6 +548,11 @@ fn read_pieces(
                     for reply in super::salts_probe::replies(piece, region.base + off) {
                         if !found.replies.contains(&reply) {
                             found.replies.push(reply);
+                        }
+                    }
+                    for summary in super::salts_probe::summaries(piece, region.base + off, watching.reply_starts) {
+                        if !found.summaries.contains(&summary) {
+                            found.summaries.push(summary);
                         }
                     }
                     if let Some((lobby_id, match_id)) = watch_lobby
@@ -1600,6 +1611,9 @@ fn run(
     // The (match, metadata salt) pairs put to Valve when keying a reply the
     // game's history could not key, once per asking (see `key_by_endings`).
     let mut valve_asked: Vec<(u64, u32)> = Vec::new();
+    // The start times of the replies the game's history did not key on the
+    // last full pass; the next one looks for those matches' summaries.
+    let mut reply_starts: Vec<u32> = Vec::new();
     // The last match the console named as begun. `match_started` is read
     // afresh every cycle and goes when the console line leaves memory, often
     // mid match; the match that then ends is still this one.
@@ -1794,6 +1808,7 @@ fn run(
                 &Watching {
                     accounts: &watch,
                     lobby: watch_lobby,
+                    reply_starts: &reply_starts,
                 },
                 &mut found,
             );
@@ -1815,6 +1830,10 @@ fn run(
             // Valve's replies, tied to their matches through the game's
             // history by start time. The salts are handed on as replay
             // addresses (`on_salts`), the same form a Steam cache file gives.
+            // A reply the history does not key may still be keyed by the
+            // summary the game keeps of its match, looked for by the reply's
+            // start time on the next full pass.
+            reply_starts.clear();
             if !found.replies.is_empty() {
                 let known: Vec<HistoryEntry> = {
                     let view = lock(&shared.view);
@@ -1825,11 +1844,23 @@ fn run(
                         .copied()
                         .collect()
                 };
+                let summarised: Vec<HistoryEntry> = known
+                    .iter()
+                    .copied()
+                    .chain(found.summaries.iter().map(super::salts_probe::Summary::as_entry))
+                    .collect();
                 let mut keyed: Vec<(u64, super::salts_probe::Reply, &str)> = Vec::new();
                 let mut unkeyed: Vec<super::salts_probe::Reply> = Vec::new();
                 for reply in found.replies.drain(..) {
-                    match super::salts_probe::match_of(&reply, &known) {
-                        Some(match_id) => keyed.push((match_id, reply, "the game's history")),
+                    if let Some(match_id) = super::salts_probe::match_of(&reply, &known) {
+                        keyed.push((match_id, reply, "the game's history"));
+                        continue;
+                    }
+                    if !reply_starts.contains(&reply.start_time) {
+                        reply_starts.push(reply.start_time);
+                    }
+                    match super::salts_probe::match_of(&reply, &summarised) {
+                        Some(match_id) => keyed.push((match_id, reply, "the match's summary")),
                         None => unkeyed.push(reply),
                     }
                 }
@@ -1879,6 +1910,9 @@ fn run(
                         keyed.push((match_id, reply, "a match that just ended, Valve agreeing"));
                     }
                 }
+                // The newest first: the match that just ended started last.
+                reply_starts.sort_unstable_by(|a, b| b.cmp(a));
+                reply_starts.truncate(super::salts_probe::SUMMARY_STARTS_AT_MOST);
                 for (match_id, reply, how) in keyed {
                     if !replied.contains(&match_id) {
                         replied.push(match_id);

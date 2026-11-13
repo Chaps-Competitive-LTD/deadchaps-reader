@@ -1,5 +1,10 @@
 # DeadChaps reader
 
+## 1.0.16
+
+- On Linux, your matches' details reach DeadChaps straight after each match again, as they do on Windows. The reader had stopped finding Valve's reply in the game under Proton. Thanks to the community member who found and fixed it.
+- When the game has not yet written a match into your history, the reader can now tell which match Valve's reply belongs to from the game's own summary of that match, without asking Valve.
+
 ## 1.0.15
 
 - The Lobby can show a new match's players a few seconds sooner. When a match starts loading, the reader now looks for its players straight away instead of a few seconds later, and still looks again at the old moment if they are not there yet, so a lobby is never shown later than before.

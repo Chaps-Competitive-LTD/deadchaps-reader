@@ -570,7 +570,7 @@ mod tests {
     /// `DEADCHAPS_PROBE_ACCOUNT=<test account> cargo test --release live_ult_fields -- --ignored --nocapture`
     /// Prints the player's own ultimate and hero damage every two seconds for
     /// two minutes, to check against a cast and the scoreboard. Read-only.
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "process"))]
     #[test]
     #[ignore = "reads the running game, by hand only"]
     fn live_ult_fields() {
@@ -604,7 +604,7 @@ mod tests {
     /// game's top bar against after a patch: both teams run lane 6, 4, 1 left
     /// to right, and a lane's two players by entity index. Run by hand like
     /// `live_ult_fields`.
-    #[cfg(windows)]
+    #[cfg(all(windows, feature = "process"))]
     #[test]
     #[ignore = "reads the running game, by hand only"]
     fn live_lane_fields() {

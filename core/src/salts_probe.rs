@@ -67,6 +67,14 @@ const AFTER_END: u32 = 20 * 60;
 /// Every field of the reply set.
 const ALL_FIELDS: u32 = 63;
 const RESULT_OK: u32 = 1;
+/// High 32 bits of the reply's first word, a pointer into a loaded module:
+/// 0x7ff… on Windows, 0x6fff… under Proton, and lower again where Wine loads
+/// a module at its preferred base. Any user-space address passes, as in
+/// deadlock-api-ingest's scan: the old Windows-only range turned away every
+/// reply under Proton. A stray 48 bytes that passed every other test still
+/// could not salt the wrong match, since a reply is only keyed by a record
+/// with its start and length or by Valve confirming the file.
+const MODULE_HIGH: std::ops::RangeInclusive<u32> = 1..=0x7fff;
 /// Unix times the game could plausibly hold (2020 to 2038).
 const TIMES: std::ops::RangeInclusive<u32> = 1_577_836_800..=2_145_916_800;
 
@@ -104,7 +112,7 @@ pub fn replies(buf: &[u8], base: usize) -> Vec<Reply> {
         if !(base + i).is_multiple_of(16) || i + 48 > buf.len() {
             continue;
         }
-        if (0x7ff0..=0x7fff).contains(&word(i + 4))
+        if MODULE_HIGH.contains(&word(i + 4))
             && word(i + 8) == 0
             && word(i + 12) == 0
             && word(i + 16) == ALL_FIELDS
@@ -141,16 +149,105 @@ fn reply_middle() -> &'static memchr::memmem::Finder<'static> {
 
 /// The match a reply is for: the history record that started when the
 /// reply says, and, when the record knows its length, ended within a few
-/// seconds of when the reply says.
+/// seconds of when the reply says. `known` holds other players' histories
+/// too, so two matches can start in the same second; then the reply is left
+/// unkeyed rather than given to whichever came first.
 pub fn match_of(reply: &Reply, known: &[HistoryEntry]) -> Option<u64> {
-    known
-        .iter()
-        .find(|e| {
-            e.start_time == reply.start_time
-                && (e.duration_s == 0
-                    || (e.start_time + e.duration_s).abs_diff(reply.end_time) <= 5)
-        })
-        .map(|e| e.match_id)
+    let mut fits = known.iter().filter(|e| {
+        e.start_time == reply.start_time
+            && (e.duration_s == 0 || (e.start_time + e.duration_s).abs_diff(reply.end_time) <= 5)
+    });
+    let first = fits.next()?.match_id;
+    fits.all(|e| e.match_id == first).then_some(first)
+}
+
+/// What the game keeps for a match it shows (the one that just ended, or
+/// one opened from a history or a profile): length, four zero bytes, the
+/// winning team (0 or 1), start time, then the match id, 4-byte aligned.
+/// Layout from deadlock-api-ingest, read from the live game on Windows and
+/// under Proton.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Summary {
+    pub match_id: u64,
+    pub start_time: u32,
+    pub duration_s: u32,
+}
+
+impl Summary {
+    /// As a history record, for [`match_of`]: only the three fields it reads
+    /// are set.
+    pub fn as_entry(&self) -> HistoryEntry {
+        HistoryEntry {
+            match_id: self.match_id,
+            hero_id: 0,
+            duration_s: self.duration_s,
+            start_time: self.start_time,
+            winning_team: 0,
+            player_team: 0,
+            kills: 0,
+            deaths: 0,
+            assists: 0,
+            last_hits: 0,
+            denies: 0,
+            hero_level: 0,
+            net_worth: 0,
+            match_mode: 0,
+            game_mode: 0,
+            outcome: 0,
+        }
+    }
+}
+
+/// The most start times one pass looks for summaries of: each is a byte
+/// search of the whole pass (about 15 ms per GB, the same as the replies'
+/// own), so the newest two, the match that just ended among them.
+pub const SUMMARY_STARTS_AT_MOST: usize = 2;
+const SUMMARY_MATCH_IDS: std::ops::Range<u64> = 1_000_000..10_000_000_000;
+const SUMMARY_MAX_DURATION: u32 = 3 * 60 * 60;
+
+/// The summaries in `buf` (at address `base`) for matches that started at
+/// one of `starts`: the start times of replies no history record keyed.
+/// Searched for by those exact start times, so the cost is a byte search
+/// per start, not a test at every word of the game.
+pub fn summaries(buf: &[u8], base: usize, starts: &[u32]) -> Vec<Summary> {
+    let word = |i: usize| {
+        buf.get(i..i + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let mut out: Vec<Summary> = Vec::new();
+    for &start in starts.iter().take(SUMMARY_STARTS_AT_MOST) {
+        let finder = crate::scan::finder(&start.to_le_bytes());
+        for at in crate::scan::all_at(&finder, buf) {
+            if !(base + at).is_multiple_of(4) || at < 12 {
+                continue;
+            }
+            let Some(match_id) = buf
+                .get(at + 4..at + 12)
+                .and_then(|b| b.try_into().ok())
+                .map(u64::from_le_bytes)
+            else {
+                continue;
+            };
+            let (Some(duration_s), Some(zero), Some(winning_team)) = (word(at - 12), word(at - 8), word(at - 4))
+            else {
+                continue;
+            };
+            let summary = Summary {
+                match_id,
+                start_time: start,
+                duration_s,
+            };
+            if (1..=SUMMARY_MAX_DURATION).contains(&duration_s)
+                && zero == 0
+                && winning_team <= 1
+                && SUMMARY_MATCH_IDS.contains(&match_id)
+                && !out.contains(&summary)
+            {
+                out.push(summary);
+            }
+        }
+    }
+    out
 }
 
 /// The demo's address, as the client would build it.
@@ -337,7 +434,7 @@ mod tests {
         };
         let mut i = (16 - base % 16) % 16;
         while i + 48 <= buf.len() {
-            if (0x7ff0..=0x7fff).contains(&word(i + 4))
+            if MODULE_HIGH.contains(&word(i + 4))
                 && word(i + 8) == 0
                 && word(i + 12) == 0
                 && word(i + 16) == ALL_FIELDS
@@ -595,6 +692,128 @@ mod tests {
             url(105_808_982, reply.cluster, reply.metadata_salt),
             "http://replay271.valve.net/1422450/105808982_2047037298.meta.bz2"
         );
+    }
+
+    #[test]
+    fn the_reply_is_read_under_proton_where_modules_sit_at_0x6fff() {
+        // Under Proton/Wine the game's modules load at 0x6fff_xxxx_xxxx, so
+        // the reply's module pointer has 0x6fff for its high word, not 0x7ff_.
+        let mut buf = reply_105808982();
+        buf[36..40].copy_from_slice(&0x6fff_u32.to_le_bytes());
+        let found = replies(&buf, 0x10);
+        assert_eq!(found.len(), 1, "the Proton reply is there to be read");
+        assert_eq!(found[0].metadata_salt, 2_047_037_298);
+        // A module Wine loaded at its preferred base (0x1_8000_0000) passes too.
+        buf[36..40].copy_from_slice(&0x1_u32.to_le_bytes());
+        assert_eq!(replies(&buf, 0x10).len(), 1);
+        // Not every high word passes: no pointer at all, or one past user space.
+        for not_a_module in [0_u32, 0x8000, 0xffff_8000] {
+            buf[36..40].copy_from_slice(&not_a_module.to_le_bytes());
+            assert!(replies(&buf, 0x10).is_empty(), "{not_a_module:#x} names no module");
+        }
+    }
+
+    /// A summary as deadlock-api-ingest read it from the live game under
+    /// Proton, for match 117936520 (started 1792150476, ran 1596 s), with
+    /// the four bytes before it and the eight after.
+    fn summary_117936520() -> Vec<u8> {
+        let mut buf = Vec::new();
+        for w in [0xABAB_ABAB_u32, 2_756_740_304, 536, 1596, 0, 0, 1_792_150_476] {
+            buf.extend_from_slice(&w.to_le_bytes());
+        }
+        buf.extend_from_slice(&117_936_520_u64.to_le_bytes());
+        for w in [1_u32, 65255] {
+            buf.extend_from_slice(&w.to_le_bytes());
+        }
+        buf
+    }
+
+    #[test]
+    fn a_summary_is_found_by_its_start_time() {
+        let buf = summary_117936520();
+        let found = summaries(&buf, 0x1000, &[1_792_150_476]);
+        assert_eq!(
+            found,
+            [Summary {
+                match_id: 117_936_520,
+                start_time: 1_792_150_476,
+                duration_s: 1596
+            }]
+        );
+        assert!(summaries(&buf, 0x1000, &[1_792_150_477]).is_empty(), "only the starts asked for");
+        assert!(summaries(&buf, 0x1002, &[1_792_150_476]).is_empty(), "4-byte aligned only");
+    }
+
+    #[test]
+    fn a_summary_needs_its_zero_word_a_real_team_and_a_length() {
+        let start = 1_792_453_292_u32;
+        // As deadlock-api-ingest read it on Windows for match 120604927, won by team 1.
+        let summary = |duration: u32, zero: u32, team: u32| {
+            let mut buf = Vec::new();
+            for w in [duration, zero, team, start] {
+                buf.extend_from_slice(&w.to_le_bytes());
+            }
+            buf.extend_from_slice(&120_604_927_u64.to_le_bytes());
+            buf
+        };
+        assert_eq!(summaries(&summary(1046, 0, 1), 0, &[start]).len(), 1);
+        assert!(summaries(&summary(1046, 0, 2), 0, &[start]).is_empty(), "there is no team 2");
+        assert!(summaries(&summary(1046, 7, 1), 0, &[start]).is_empty());
+        assert!(summaries(&summary(0, 0, 1), 0, &[start]).is_empty());
+    }
+
+    #[test]
+    fn a_proton_reply_with_no_history_record_is_keyed_by_the_summary() {
+        // The reply deadlock-api-ingest read under Proton for match 117936520:
+        // valid through 1793964876 (start + 21 days), processed through
+        // 1792153272 (end + 20 minutes), cluster 118.
+        let mut buf = vec![0_u8; 32];
+        for w in [
+            0x1234_5678_u32,
+            0x6fff,
+            0,
+            0,
+            ALL_FIELDS,
+            0,
+            RESULT_OK,
+            1_330_069_048,
+            1_285_305_573,
+            1_793_964_876,
+            118,
+            1_792_153_272,
+        ] {
+            buf.extend_from_slice(&w.to_le_bytes());
+        }
+        buf.extend_from_slice(&[0; 16]);
+        let reply = replies(&buf, 0x10)[0];
+        assert_eq!(match_of(&reply, &[]), None, "no history record");
+        let known: Vec<HistoryEntry> = summaries(&summary_117936520(), 0, &[reply.start_time])
+            .iter()
+            .map(Summary::as_entry)
+            .collect();
+        assert_eq!(match_of(&reply, &known), Some(117_936_520));
+        assert_eq!(
+            url(117_936_520, reply.cluster, reply.metadata_salt),
+            "http://replay118.valve.net/1422450/117936520_1285305573.meta.bz2"
+        );
+    }
+
+    #[test]
+    fn a_start_two_matches_share_keys_neither() {
+        let reply = replies(&reply_105808982(), 0x10)[0];
+        let record = |match_id: u64| Summary {
+            match_id,
+            start_time: reply.start_time,
+            duration_s: reply.end_time - reply.start_time,
+        }
+        .as_entry();
+        assert_eq!(match_of(&reply, &[record(105_808_982)]), Some(105_808_982));
+        assert_eq!(
+            match_of(&reply, &[record(105_808_982), record(105_808_982)]),
+            Some(105_808_982),
+            "two copies of one record are one match"
+        );
+        assert_eq!(match_of(&reply, &[record(105_808_982), record(105_808_990)]), None);
     }
 
     #[test]

@@ -72,6 +72,10 @@ fn main() {
         total += row("rules scan", &|b| rules::scan(b, 0x1000_0000).0.len());
         total += row("friend records", &|b| friends_presence::find_records(b, 0x1000_0000).len());
         total += row("valve replies", &|b| salts_probe::replies(b, 0x1000_0000).len());
+        // Only while a reply is unkeyed, by its start time, up to SUMMARY_STARTS_AT_MOST.
+        row("summaries, 1 start", &|b| salts_probe::summaries(b, 0x1000_0000, &[1_792_150_476]).len());
+        let starts: Vec<u32> = (0..2).map(|i| 1_792_150_476 + i * 977).collect();
+        total += row("summaries, 2 starts", &|b| salts_probe::summaries(b, 0x1000_0000, &starts).len());
         total += row("lobby object", &|b| salts_probe::find_lobby(b, 0x1000_0000, 123_456, 61_834_207).len());
         println!("  {:<22} {:>8.1} ms/GB", "ALL", total.as_secs_f64() * 1000.0);
     }
