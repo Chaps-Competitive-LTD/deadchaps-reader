@@ -1370,6 +1370,41 @@ fn hold_us(
         .then(|| us.clone())
 }
 
+/// Whether the hideout the local player stood in is gone: our object no
+/// longer reads, and every object that still does sits on the spectators'
+/// team. Joining a friend's party moves the player to another hideout, with
+/// new objects for both; alone before, nothing of the old one is left and
+/// the lobby reads empty, which starts the sweeps that find the new one.
+/// A watcher's object outlives the move. `hold_us` took it for the lobby
+/// staying and kept our old read, so no sweep ran and the party was never
+/// read: logged 23 Nov 2026, eight minutes in a party of two shown as a
+/// player alone, until the match's own pass. A watcher is not the party
+/// (`MemoryView::party` leaves the spectators' team out), so it cannot stand
+/// for it here either.
+///
+/// Only in the hideout, and only for a party's worth of objects: a match
+/// that is loading puts all twelve players on the spectators' team for a
+/// few seconds, and that lobby is held as before.
+fn hideout_left(
+    raw: &[MatchPlayer],
+    last_us: Option<&MatchPlayer>,
+    previous: &[u32],
+    in_hideout: bool,
+) -> bool {
+    in_hideout
+        && !raw.is_empty()
+        && raw.len() <= PARTY_MAX
+        && last_us.is_some_and(|us| previous.contains(&us.account_id))
+        && raw.iter().all(|p| !p.is_us && p.team == SPECTATORS)
+}
+
+/// How many of the players read are ones a sweep looks for: ours, and anyone
+/// off the spectators' team. A sweep stops once players are read, and a
+/// watcher's object alone must not stop it: the party's are still to come.
+fn sought(players: &[MatchPlayer]) -> usize {
+    players.iter().filter(|p| p.is_us || p.team != SPECTATORS).count()
+}
+
 /// Whether an end line's match is listed as ours: not when our player was
 /// last read as a spectator (the spectators' team, or no seat). Read with no
 /// player at all (the reader attached after the match) it is still listed,
@@ -1765,7 +1800,7 @@ fn run(
             let in_match = !v.match_players.is_empty() && !v.in_hideout();
             (in_match, in_match && missing_seats(&v.match_players) == 0)
         };
-        let players_before = lock(&shared.view).match_players.len();
+        let players_before = sought(&lock(&shared.view).match_players);
         let sweeping = our_account.is_some()
             && seating_sweeps(seating_from.map(|at| at.elapsed()), players_before, seated_short);
         // A pass for players that no longer waits does the looking itself:
@@ -2319,7 +2354,16 @@ fn run(
             .map(|p| p.account_id)
             .collect();
         let mut raw: Vec<MatchPlayer> = found.players.iter().map(|(_, p)| p.clone()).collect();
-        if let Some(us) = hold_us(&raw, last_us.as_ref(), &previous) {
+        let was_hideout = lock(&shared.view).in_hideout();
+        let left = hideout_left(&raw, last_us.as_ref(), &previous, was_hideout);
+        if left {
+            info!(
+                "Game memory: our object is gone and only watchers are left: the hideout changed, sweeping for the next players for up to {} s",
+                SEATING_FOR.as_secs()
+            );
+            seating_from = Some(Instant::now());
+        }
+        if let Some(us) = hold_us(&raw, last_us.as_ref(), &previous).filter(|_| !left) {
             if !holding {
                 info!(
                     "Game memory: our object is gone while the lobby stays (kingme?), keeping our last read"
@@ -3450,7 +3494,7 @@ mod tests {
         // that is still the hideout.
         view.match_players = vec![
             seated(123_762_552, 2, 0, false),
-            seated(259_283_165, 2, 0, false),
+            seated(1_000_000_222, 2, 0, false),
             seated(1_161_088_555, 3, 0, true),
         ];
         assert!(view.in_hideout(), "a duel in the hideout is not a match");
@@ -3552,7 +3596,7 @@ mod tests {
             at(32_957_432, 2, 6, 30, false),
             at(1_478_654_968, 3, 7, 33, false),
             at(923_322_541, 3, 8, 32, false),
-            at(259_283_165, 3, 10, 39, false),
+            at(1_000_000_222, 3, 10, 39, false),
             at(US, 3, 11, 32, true),
         ];
         let roster = (108_967_377_u64, last_seated);
@@ -3562,7 +3606,7 @@ mod tests {
             at(US, 2, 4, 1, true),
             at(32_957_432, 2, 6, 30, false),
             at(1_478_654_968, 3, 7, 33, false),
-            at(259_283_165, 3, 10, 39, false),
+            at(1_000_000_222, 3, 10, 39, false),
         ];
         let kept: Vec<u32> = hideout
             .iter()
@@ -3571,7 +3615,7 @@ mod tests {
             .collect();
         assert_eq!(kept, vec![US], "only our new object is read");
         // Later, the friend's own hideout object: level 1, a new seat.
-        let friend_back = at(259_283_165, 2, 3, 1, false);
+        let friend_back = at(1_000_000_222, 2, 3, 1, false);
         assert!(!match_leftover(&friend_back, Some(&roster), Some(108_967_377)));
         // Before the end line names the match over, nothing is left out: the
         // end screen still shows the lobby, and a player who has not moved
@@ -3694,17 +3738,17 @@ mod tests {
         let view = MemoryView {
             match_players: vec![
                 at(870_547_025, 1, 0, 0, false),
-                at(242_872_005, 1, 0, 0, false),
+                at(1_000_000_333, 1, 0, 0, false),
                 at(106_448_300, 2, 3, 1, true),
                 at(123_762_552, 2, 4, 1, false),
-                at(259_283_165, 2, 5, 1, false),
+                at(1_000_000_222, 2, 5, 1, false),
             ],
             ..MemoryView::default()
         };
         assert!(view.in_hideout());
         assert_eq!(
             view.party().iter().map(|p| p.account_id).collect::<Vec<_>>(),
-            vec![106_448_300, 123_762_552, 259_283_165]
+            vec![106_448_300, 123_762_552, 1_000_000_222]
         );
         // Ours is kept whatever team the game has us on while it loads.
         let loading = MemoryView {
@@ -3852,6 +3896,48 @@ mod tests {
             "a new face is a new lobby"
         );
         assert_eq!(hold_us(&[other_player], Some(&us), &[]), None, "no lobby before");
+    }
+
+    /// As logged 23 Nov 2026: alone in the hideout at team 2 slot 1 with a
+    /// watcher's object on the spectators' team, then our object gone as the
+    /// player joined a friend's party hideout, the watcher's still reading.
+    #[test]
+    fn a_watcher_alone_is_not_the_hideout_staying() {
+        let us = seated(106_448_300, 2, 1, true);
+        let watcher = seated(1_000_000_333, SPECTATORS, 0, false);
+        let previous = [1_000_000_333, 106_448_300];
+        let left = std::slice::from_ref(&watcher);
+        assert!(hideout_left(left, Some(&us), &previous, true));
+        // the old rule held our last read here, which is what hid the party
+        assert_eq!(hold_us(left, Some(&us), &previous).map(|p| p.account_id), Some(106_448_300));
+
+        assert!(!hideout_left(left, Some(&us), &previous, false), "not in a match");
+        assert!(!hideout_left(&[], Some(&us), &previous, true), "an empty read empties the lobby by itself");
+        assert!(!hideout_left(left, None, &previous, true), "we were never read");
+        assert!(!hideout_left(left, Some(&us), &[1_000_000_333], true), "we were not in the last read: said once");
+        assert!(!hideout_left(&[watcher.clone(), us.clone()], Some(&us), &previous, true), "we are there");
+        // the `kingme` case keeps its hold: a party member's object stays
+        let friend = seated(1_000_000_222, 2, 4, false);
+        assert!(!hideout_left(&[watcher.clone(), friend], Some(&us), &previous, true));
+        // a loading match: everyone on the spectators' team, more than a party
+        let loading: Vec<MatchPlayer> = (1..=11).map(|n| seated(n, SPECTATORS, 0, false)).collect();
+        assert!(!hideout_left(&loading, Some(&us), &previous, true));
+    }
+
+    #[test]
+    fn a_sweep_looks_past_watchers() {
+        let us = seated(106_448_300, 2, 1, true);
+        let watcher = seated(1_000_000_333, SPECTATORS, 0, false);
+        assert_eq!(sought(&[]), 0);
+        assert_eq!(sought(std::slice::from_ref(&watcher)), 0);
+        assert_eq!(sought(&[watcher.clone(), us]), 1);
+        // spectating a match ourselves, or a match still loading us in
+        let us_watching = seated(106_448_300, SPECTATORS, 0, true);
+        assert_eq!(sought(&[us_watching, watcher.clone()]), 1);
+        assert_eq!(sought(&[watcher, seated(9, 3, 7, false)]), 1);
+        // with only a watcher read the sweeps go on, as with nobody read
+        assert!(seating_sweeps(Some(Duration::from_secs(5)), 0, false));
+        assert!(!seating_sweeps(Some(Duration::from_secs(5)), 1, false));
     }
 
     /// Twelve players read, then only our own object (team 3 slot 11) for

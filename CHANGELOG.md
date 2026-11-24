@@ -1,5 +1,9 @@
 # DeadChaps reader
 
+## 1.0.17
+
+- The Lobby shows your party again after you join a friend's party from your own hideout. When someone was watching, their player stayed in the game's memory through the move, and the reader took that for your old hideout still being there, so it kept showing you alone until the match started. It now looks for the new hideout's players straight away.
+
 ## 1.0.16
 
 - On Linux, your matches' details reach DeadChaps straight after each match again, as they do on Windows. The reader had stopped finding Valve's reply in the game under Proton. Thanks to the community member who found and fixed it.
