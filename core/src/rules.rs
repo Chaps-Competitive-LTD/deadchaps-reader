@@ -10,7 +10,8 @@
 //!   (10752, 10752, 0), which is how the object is found in a pass;
 //! - the match mode, expected player count and winning team, and the mid
 //!   boss block (kill count, each team's rejuvenator credits, next spawn),
-//!   at the offsets below, from the client schema of build 25611908.
+//!   at the offsets below, from the client schema of build 25611908, the
+//!   mid boss block and the clock as moved by client 6871 (build 26953664).
 //!
 //! The game time itself is on each player's controller (see
 //! [`crate::players::GAME_TIME`]), and it keeps running through a pause. The
@@ -42,9 +43,14 @@ const PLAYERS: usize = 0xB4;
 /// a second, it goes from -1 to the winner in the same read as the state goes
 /// from 7 (being played) to 8.
 const WINNER: usize = 0xC0;
-const BOSS_KILLS: usize = 0x220;
+// Client 6871 (build 26953664) put three Unstable Rift fields before the mid
+// boss block and the two rejuvenator expiry times after the credits, so the
+// kill count moved 0x220 to 0x22C and the next spawn 0x22C to 0x240. At 0x220
+// the object now holds a hero drafter handle, which no longer reads as a count
+// and kept the whole object from being found.
+const BOSS_KILLS: usize = 0x22C;
 /// The rejuvenator credits each team holds: `m_iAmberRejuvCount` and
-/// `m_iSapphireRejuvCount` in the client schema of build 25611908. Each
+/// `m_iSapphireRejuvCount` in the client schema of client 6871. Each
 /// heavy hit on the dropped rejuvenator banks one credit for the hitter's
 /// team, three between them, and they run out when spent on a revive or
 /// after 180 s (generic_data's m_flRejuvinatorRebirthDuration). The game's
@@ -52,11 +58,11 @@ const BOSS_KILLS: usize = 0x220;
 ///
 /// Both counts are read: either team can hold the credits, so one count
 /// alone misses every rejuvenator the other team takes.
-const AMBER_REJUV: usize = 0x224;
-const SAPPHIRE_REJUV: usize = 0x228;
+const AMBER_REJUV: usize = 0x230;
+const SAPPHIRE_REJUV: usize = 0x234;
 /// More credits than this is not a count.
 const MAX_REJUV: u32 = 16;
-const NEXT_BOSS: usize = 0x22C;
+const NEXT_BOSS: usize = 0x240;
 /// How much of the object is read each time.
 pub const READ_BYTES: usize = NEXT_BOSS + 4;
 /// `m_vecBannedHeroes`, the heroes banned in the draft: a vector of hero ids,
@@ -70,9 +76,10 @@ pub const BANS_BYTES: usize = 0x10;
 pub const MAX_BANS: usize = 12;
 /// Hero ids are small; anything above this is not one.
 const MAX_HERO_ID: u32 = 1000;
-/// The match clock's fields in build 25611908, read separately: they sit
-/// 40 KB further on.
-pub const CLOCK_AT: usize = 0x9FD4; // m_iPauseTeam; the tick and clock follow at +4 and +8
+/// The match clock's fields, read separately: they sit 40 KB further on.
+/// Client 6871 moved the whole block 0x18 on (0x9FD4 to 0x9FEC), its own
+/// layout unchanged.
+pub const CLOCK_AT: usize = 0x9FEC; // m_iPauseTeam; the tick and clock follow at +4 and +8
 pub const CLOCK_BYTES: usize = 0x28;
 const PAUSE_TEAM: usize = 0x00;
 const CLOCK_TICK: usize = 0x04;
@@ -373,12 +380,13 @@ mod tests {
         assert!((rules.next_boss - 1795.312).abs() < 1e-3);
     }
 
-    /// The mid boss block as the client schema of build 25611908 lays it
-    /// out: kills 0x220, Amber's credits 0x224, Sapphire's 0x228, the next
-    /// spawn 0x22C. Credits held by Amber alone must still count.
+    /// The mid boss block as the client schema of client 6871 lays it
+    /// out: kills 0x22C, Amber's credits 0x230, Sapphire's 0x234, the next
+    /// spawn 0x240. Credits held by Amber alone must still count.
     #[test]
     fn either_teams_rejuvenator_credits_are_read() {
-        assert_eq!((BOSS_KILLS, AMBER_REJUV, SAPPHIRE_REJUV, NEXT_BOSS), (0x220, 0x224, 0x228, 0x22C));
+        assert_eq!((BOSS_KILLS, AMBER_REJUV, SAPPHIRE_REJUV, NEXT_BOSS), (0x22C, 0x230, 0x234, 0x240));
+        assert_eq!(CLOCK_AT, 0x9FEC);
         let mut amber = object(58.2, 1, 1460.0);
         amber[AMBER_REJUV..AMBER_REJUV + 4].copy_from_slice(&3_u32.to_le_bytes());
         let rules = parse(&amber).expect("rules");

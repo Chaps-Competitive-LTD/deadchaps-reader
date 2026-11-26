@@ -1,5 +1,9 @@
 # DeadChaps reader
 
+## 1.0.18
+
+- Works with the game update of 26 November. The update moved where the game keeps the match's rules, so the reader could not find them. The match timer, the Mid Boss and rejuvenator timers, bans and the end of the match are back, and pugs finish on their own again.
+
 ## 1.0.17
 
 - The Lobby shows your party again after you join a friend's party from your own hideout. When someone was watching, their player stayed in the game's memory through the move, and the reader took that for your old hideout still being there, so it kept showing you alone until the match started. It now looks for the new hideout's players straight away.
