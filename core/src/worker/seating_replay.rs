@@ -104,7 +104,10 @@ fn sweep_cost(s: &Seating) -> (f64, f64) {
         .expect("a pass");
     let cpu = read + PLAYER_SEARCH_PER_GB * f64::from(mb) / 1024.0;
     let rests = (u64::from(mb) << 20) / THROTTLE_EVERY as u64;
-    (cpu + rests as f64 * SWEEP_PAUSE.as_secs_f64(), cpu)
+    // each rest follows what its block took (`rest_after`, at Balanced)
+    let block = Duration::from_secs_f64(cpu / rests.max(1) as f64);
+    let rest = rest_after(SWEEP_PAUSE, block, crate::protocol::Speed::Balanced).as_secs_f64();
+    (cpu + rests as f64 * rest, cpu)
 }
 
 #[derive(Default, Debug)]

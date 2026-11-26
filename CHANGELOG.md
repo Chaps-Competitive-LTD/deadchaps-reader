@@ -1,5 +1,10 @@
 # DeadChaps reader
 
+## 1.0.19
+
+- Easier on lower-end PCs while the game loads. On a slower PC the reader now rests in proportion to how long its reading takes, so it never uses more than three quarters of one processor core, and less on the Slow setting. On most PCs nothing changes.
+- No longer reads the whole game a second time just after it has already found you. That extra read could take a slower PC 40 seconds of work for nothing.
+
 ## 1.0.18
 
 - Works with the game update of 26 November. The update moved where the game keeps the match's rules, so the reader could not find them. The match timer, the Mid Boss and rejuvenator timers, bans and the end of the match are back, and pugs finish on their own again.

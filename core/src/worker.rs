@@ -37,6 +37,34 @@ const WATCH_FOR: Duration = Duration::from_secs(3600);
 /// a whole core away from the game.
 const THROTTLE_EVERY: usize = 64 << 20;
 const THROTTLE_PAUSE: Duration = Duration::from_millis(40);
+
+/// The rest after a read of `THROTTLE_EVERY` bytes that took `work`: the
+/// fixed rest `fixed`, or longer on a PC where the read itself is slow, so
+/// the reader takes at most three quarters of a core at Balanced and half
+/// at Slow whatever the PC (26 Nov 2026). The fixed rests were set on a
+/// mid-range PC, where 64 MB takes 20 to 26 ms to sweep and 70 ms to pass,
+/// and a third of those is under the fixed rest, so nothing changes there;
+/// on a PC short of memory a sweep spent about 300 ms on each, so its 10 ms
+/// rest left it on a whole core for 47 s while the game loaded. Fast keeps
+/// the fixed rest alone.
+fn rest_after(fixed: Duration, work: Duration, speed: crate::protocol::Speed) -> Duration {
+    use crate::protocol::Speed;
+    fixed.max(match speed {
+        Speed::Fast => Duration::ZERO,
+        Speed::Balanced => work / 3,
+        Speed::Slow => work,
+    })
+}
+
+/// A full pass's fixed rest at a reading speed.
+fn pass_rest_fixed(speed: crate::protocol::Speed) -> Duration {
+    use crate::protocol::Speed;
+    match speed {
+        Speed::Fast => Duration::ZERO,
+        Speed::Balanced => THROTTLE_PAUSE,
+        Speed::Slow => THROTTLE_PAUSE * 2,
+    }
+}
 /// How often the kept pieces (those that held history, the console or the
 /// rich presence) are read again.
 const WATCH_EVERY: Duration = Duration::from_secs(20);
@@ -495,6 +523,7 @@ fn read_pieces(
     let now = u32::try_from(unix_now()).unwrap_or(u32::MAX);
     let mut buf = vec![0_u8; CHUNK];
     let mut since_pause = 0_usize;
+    let mut block_from = Instant::now();
     for region in regions {
         let mut off = 0_usize;
         while off < region.size {
@@ -598,11 +627,12 @@ fn read_pieces(
             since_pause += got;
             if throttle && since_pause >= THROTTLE_EVERY {
                 since_pause = 0;
-                match speed() {
-                    crate::protocol::Speed::Fast => {}
-                    crate::protocol::Speed::Balanced => thread::sleep(THROTTLE_PAUSE),
-                    crate::protocol::Speed::Slow => thread::sleep(THROTTLE_PAUSE * 2),
+                let speed = speed();
+                let rest = rest_after(pass_rest_fixed(speed), block_from.elapsed(), speed);
+                if !rest.is_zero() {
+                    thread::sleep(rest);
                 }
+                block_from = Instant::now();
             }
             if want <= OVERLAP || off + want >= region.size {
                 break;
@@ -733,6 +763,20 @@ fn short_pass_wanted(seated: bool, missing: usize, tries: u32) -> bool {
 /// within a minute would go unseen.
 fn settling_pass_wanted(attached_for: Duration, seen_us: bool) -> bool {
     !seen_us && attached_for < SETTLE_FOR
+}
+
+/// Whether a full pass asked for to find players (`wanted`) is still wanted
+/// after a turn: not once that turn's own sweep (`swept`) read our player
+/// (`us_read`) with no seat unread, the very thing the pass was for, unless a
+/// pass is owed because the last one read a game still starting
+/// (`loading_owed`), whose history and friends a sweep does not read. Only a
+/// sweep's find counts: while the queue pops the hideout party is still read
+/// without one, and the pass asked for then must keep waiting. Without this a
+/// sweep that found the player was followed four seconds later by the pass
+/// that had been asked for before it: 8 GB and 34 s of CPU on a slow PC for
+/// nothing (log 21, 26 Nov 2026).
+fn players_pass_still_wanted(wanted: bool, loading_owed: bool, swept: bool, us_read: bool, missing: usize) -> bool {
+    wanted && (loading_owed || !(swept && us_read && missing == 0))
 }
 
 /// How long after the last sign of players coming the reader keeps sweeping
@@ -885,19 +929,21 @@ fn queue_stopped(was: bool, now: bool) -> bool {
 /// rules, Valve's replies or the friend records. `read` takes an address
 /// and a buffer and returns the bytes read; outside tests it reads the
 /// game. Pieces overlap as a full pass's do, so an object across two is
-/// read whole. `pause` runs after every `THROTTLE_EVERY` bytes and returns
-/// whether to carry on: a sweep with a deadline stops there, having read
-/// only part of the game. Returns the bytes read.
+/// read whole. `pause` runs after every `THROTTLE_EVERY` bytes with how long
+/// those bytes took to read and search, and returns whether to carry on: a
+/// sweep with a deadline stops there, having read only part of the game.
+/// Returns the bytes read.
 fn sweep_players(
     read: impl Fn(usize, &mut [u8]) -> usize,
     regions: &[Region],
     our_account: u32,
-    mut pause: impl FnMut() -> bool,
+    mut pause: impl FnMut(Duration) -> bool,
     found: &mut Vec<(usize, MatchPlayer)>,
 ) -> usize {
     let mut buf = vec![0_u8; CHUNK];
     let mut bytes = 0_usize;
     let mut since_pause = 0_usize;
+    let mut block_from = Instant::now();
     'regions: for region in regions {
         let mut off = 0_usize;
         while off < region.size {
@@ -912,9 +958,10 @@ fn sweep_players(
             since_pause += got;
             if since_pause >= THROTTLE_EVERY {
                 since_pause = 0;
-                if !pause() {
+                if !pause(block_from.elapsed()) {
                     break 'regions;
                 }
+                block_from = Instant::now();
             }
             if want <= OVERLAP || off + want >= region.size {
                 break;
@@ -1553,6 +1600,9 @@ fn run(
     // queue stopping, our player not read yet): it waits while the sweeps
     // look, which do that for a quarter of the cost, and runs once they stop.
     let mut want_for_players = false;
+    // The last pass read a game still starting, so a pass is owed for its
+    // history and friends, which a sweep finding the players does not read.
+    let mut loading_owed = false;
     // Why the next pass runs, for its log line.
     let mut pass_reason = "the game attached";
     // Whether the last pass kept pieces holding history or an end line.
@@ -2027,6 +2077,7 @@ fn run(
             // soon, not in ten minutes.
             want_pass = false;
             want_for_players = found.bytes < STILL_LOADING_BYTES;
+            loading_owed = want_for_players;
             pass_reason = if want_for_players { "the game still loading" } else { "the schedule" };
             // What became of the accounts seen lately that this pass did not
             // list: an object turned away says why, or there was none.
@@ -2218,8 +2269,8 @@ fn run(
                 |a, b| process.read(a, b),
                 &regions,
                 account,
-                || {
-                    thread::sleep(SWEEP_PAUSE);
+                |work| {
+                    thread::sleep(rest_after(SWEEP_PAUSE, work, speed()));
                     cut.set(deadline.is_some_and(|by| Instant::now() >= by));
                     !cut.get()
                 },
@@ -2561,6 +2612,11 @@ fn run(
         if settling_pass_wanted(attached_at.elapsed(), seen_us) {
             want_for_players = true;
             pass_reason = "our player not found yet";
+        }
+        let us_read = match_players.iter().any(|p| p.is_us);
+        if want_for_players && !players_pass_still_wanted(true, loading_owed, sweep_ran, us_read, missing) {
+            want_for_players = false;
+            info!("Game memory: the sweep read our player and every seat, so the pass asked for to find them is dropped");
         }
         // The game's own end signal, logged and published whether the local
         // player is seated or watching from a spectator slot, so a
@@ -3170,7 +3226,7 @@ mod tests {
         };
         let mut pauses = 0;
         let mut found = Vec::new();
-        let bytes = sweep_players(read, &regions, US, || { pauses += 1; true }, &mut found);
+        let bytes = sweep_players(read, &regions, US, |_| { pauses += 1; true }, &mut found);
         let at: Vec<usize> = found.iter().map(|(at, _)| *at).collect();
         let mut want: Vec<usize> = spots_a.iter().map(|s| base_a + s).collect();
         want.push(base_b + 0x100);
@@ -3187,7 +3243,7 @@ mod tests {
         // A rest that says stop ends the sweep there: the first 64 MB read,
         // the objects past it and the second region not.
         let mut cut = Vec::new();
-        let bytes = sweep_players(read, &regions, US, || false, &mut cut);
+        let bytes = sweep_players(read, &regions, US, |_| false, &mut cut);
         assert!((THROTTLE_EVERY..THROTTLE_EVERY + CHUNK).contains(&bytes), "stopped at the first rest: {bytes}");
         let at: Vec<usize> = cut.iter().map(|(at, _)| *at).collect();
         assert_eq!(at, vec![base_a + spots_a[0], base_a + spots_a[1]]);
@@ -4182,5 +4238,73 @@ mod tests {
                 println!("  {} {:?}", p.account_id, p.presence);
             }
         }
+    }
+}
+
+/// Reading on a slow PC (log 21, 26 Nov 2026): the rest follows what each
+/// 64 MB took, and a pass asked for to find players is dropped once a sweep
+/// has found them.
+#[cfg(test)]
+mod slow_pc_tests {
+    use super::*;
+    use crate::protocol::Speed;
+
+    const MS: fn(u64) -> Duration = Duration::from_millis;
+
+    #[test]
+    fn a_slow_read_rests_in_proportion_and_a_quick_one_as_before() {
+        // A mid-range PC: a sweep's 64 MB in 20 to 26 ms (the recorded
+        // seatings), a pass's in 70 ms, keep the fixed rests they always had.
+        assert_eq!(rest_after(SWEEP_PAUSE, MS(19), Speed::Balanced), SWEEP_PAUSE);
+        assert_eq!(rest_after(SWEEP_PAUSE, MS(26), Speed::Balanced), SWEEP_PAUSE);
+        assert_eq!(rest_after(pass_rest_fixed(Speed::Balanced), MS(70), Speed::Balanced), THROTTLE_PAUSE);
+        assert_eq!(rest_after(pass_rest_fixed(Speed::Slow), MS(70), Speed::Slow), THROTTLE_PAUSE * 2);
+        // Log 21's PC: about 300 ms a block. Balanced rests a third of it, so
+        // the reader takes three quarters of a core, Slow all of it, half.
+        assert_eq!(rest_after(SWEEP_PAUSE, MS(300), Speed::Balanced), MS(100));
+        assert_eq!(rest_after(SWEEP_PAUSE, MS(300), Speed::Slow), MS(300));
+        assert_eq!(rest_after(pass_rest_fixed(Speed::Balanced), MS(270), Speed::Balanced), MS(90));
+        // Fast keeps the fixed rest alone: none in a pass, the sweep's 10 ms.
+        assert_eq!(rest_after(pass_rest_fixed(Speed::Fast), MS(300), Speed::Fast), Duration::ZERO);
+        assert_eq!(rest_after(SWEEP_PAUSE, MS(300), Speed::Fast), SWEEP_PAUSE);
+        for work in [1, 20, 100, 300, 2000] {
+            let (w, r) = (MS(work), rest_after(SWEEP_PAUSE, MS(work), Speed::Balanced));
+            assert!(w.as_secs_f64() / (w + r).as_secs_f64() <= 0.75 + 1e-6, "{work} ms busy over three quarters");
+        }
+    }
+
+    /// The real sweep over a read that takes 5 ms a 4 MB piece, 80 ms a block:
+    /// the rest is told what each block took.
+    #[test]
+    fn the_sweep_tells_the_rest_how_long_each_block_took() {
+        let regions = [Region { base: 0x4000_0000_0000, size: 192 << 20 }];
+        let read = |_addr: usize, buf: &mut [u8]| -> usize {
+            thread::sleep(MS(5));
+            buf.len()
+        };
+        let mut works = Vec::new();
+        let mut found = Vec::new();
+        sweep_players(read, &regions, 7, |work| { works.push(work); true }, &mut found);
+        assert!(works.len() >= 2, "{works:?}");
+        for w in &works {
+            // 16 pieces of 5 ms each make a block; no rest counted in it.
+            assert!((MS(75)..MS(400)).contains(w), "block took {w:?}");
+            assert!(rest_after(SWEEP_PAUSE, *w, Speed::Balanced) >= MS(25), "{w:?}");
+        }
+    }
+
+    #[test]
+    fn a_players_pass_is_dropped_once_a_sweep_reads_them() {
+        // Log 21: the sweep at 18:42:17 read our player in the sandbox, every
+        // seat there is; the pass asked for before it was not needed.
+        assert!(!players_pass_still_wanted(true, false, true, true, 0));
+        // Not dropped: a seat still unread, our player not read, nothing
+        // swept this turn (the queue popping with the hideout party still
+        // read), or a pass owed for a game read while still starting.
+        assert!(players_pass_still_wanted(true, false, true, true, 3), "seats unread");
+        assert!(players_pass_still_wanted(true, false, true, false, 0), "our player not read");
+        assert!(players_pass_still_wanted(true, false, false, true, 0), "no sweep this turn");
+        assert!(players_pass_still_wanted(true, true, true, true, 0), "the history still owed");
+        assert!(!players_pass_still_wanted(false, true, false, false, 5), "nothing asked");
     }
 }
